@@ -1,9 +1,9 @@
 from __future__ import annotations
 # =====================================================================
 # VALUE SCAN — 単一ファイル版（SUUMO解析→国交省照会→相場推定→Web/LINE出力）
-#   ※APIキー未設定なら自動でデモ動作（サンプル事例）
+#   判定テキスト＋年別チャート(QuickChart)。APIキー未設定なら自動デモ。
 # =====================================================================
-import base64, hashlib, hmac, json, os, math, re, statistics, datetime
+import base64, hashlib, hmac, json, os, math, re, statistics, datetime, urllib.parse
 from dataclasses import dataclass, field, asdict
 from datetime import datetime as _dt
 from functools import lru_cache
@@ -1321,6 +1321,7 @@ class Appraisal:
     n_deals: int = 0
     method: str = ""
     representative: list = field(default_factory=list)
+    yearly: list = field(default_factory=list)
 
 
 def appraise(area_m2, age, asking_price, comps):
@@ -1376,6 +1377,15 @@ def appraise(area_m2, age, asking_price, comps):
                 abs((c.area or 0) - area_m2))
     representative = sorted(used, key=sim_key)[:5]
 
+    # 年別集計（チャート用）: 取引年ごとの市場価格(万円)と流通戸数
+    ybuckets = {}
+    for c in comps:
+        y = _comp_year(c)
+        if y:
+            ybuckets.setdefault(y, []).append(c.unit_price)
+    yearly = [{"year": y, "market_man": round(statistics.fmean(v) * area_m2 / 1_0000),
+               "count": len(v)} for y, v in sorted(ybuckets.items())]
+
     return Appraisal(
         ok=True,
         estimated_unit_price=est_unit, estimated_price=estimated_price,
@@ -1393,6 +1403,7 @@ def appraise(area_m2, age, asking_price, comps):
         confidence=_confidence(len(used), cv),
         n_comps=len(comps), n_deals=n_deals, method=method,
         representative=representative,
+        yearly=yearly,
     )
 
 
@@ -1478,7 +1489,9 @@ def _appraise(prop, use_mock=False, demo=False):
         return Result(ok=False, prop=prop, city_name=city_name, appraisal=ap, message=ap.message, demo=demo)
     return Result(ok=True, prop=prop, appraisal=ap, city_name=city_name, demo=demo)
 
-"""LINE返信メッセージ（VALUE SCAN）。判定結果を詳細テキストで返す。"""
+"""LINE返信（VALUE SCAN）。判定テキスト＋QuickChartの年別チャート画像。"""
+import json
+import urllib.parse
 
 
 def build_result_text(result):
@@ -1510,10 +1523,45 @@ def build_result_text(result):
     ])
 
 
+def year_chart_url(ap):
+    """年別の市場価格(線)＋当該物件価格(赤線)＋流通戸数(棒) を QuickChart で。"""
+    yl = getattr(ap, "yearly", None)
+    if not yl or len(yl) < 2:
+        return None
+    yl = yl[-10:]
+    labels = [str(d["year"]) for d in yl]
+    market = [d["market_man"] for d in yl]
+    counts = [d["count"] for d in yl]
+    asking = round((ap.asking_price or 0) / 1_0000)
+    cfg = {"type": "bar", "data": {"labels": labels, "datasets": [
+        {"type": "line", "label": "当該物件価格", "data": [asking] * len(labels),
+         "borderColor": "rgb(230,30,30)", "backgroundColor": "rgb(230,30,30)",
+         "fill": False, "pointRadius": 0, "yAxisID": "L"},
+        {"type": "line", "label": "市場物件価格(所在階)", "data": market,
+         "borderColor": "rgb(30,60,230)", "backgroundColor": "rgb(30,60,230)",
+         "fill": False, "yAxisID": "L"},
+        {"type": "bar", "label": "流通戸数", "data": counts,
+         "backgroundColor": "rgba(80,130,230,0.55)", "yAxisID": "R"}]},
+        "options": {"title": {"display": True, "text": "年別 市場価格と流通戸数"},
+                    "scales": {"yAxes": [
+                        {"id": "L", "position": "left",
+                         "scaleLabel": {"display": True, "labelString": "万円"}},
+                        {"id": "R", "position": "right",
+                         "gridLines": {"drawOnChartArea": False},
+                         "scaleLabel": {"display": True, "labelString": "戸"}}]}}}
+    c = json.dumps(cfg, ensure_ascii=False, separators=(",", ":"))
+    url = "https://quickchart.io/chart?w=640&h=400&bkg=white&c=" + urllib.parse.quote(c)
+    return url if len(url) <= 1900 else None
+
+
 def build_messages(result):
-    if result.ok:
-        return [{"type": "text", "text": build_result_text(result)}]
-    return [{"type": "text", "text": "⚠️ " + (result.message or "判定できませんでした。")}]
+    if not result.ok:
+        return [{"type": "text", "text": "⚠️ " + (result.message or "判定できませんでした。")}]
+    msgs = [{"type": "text", "text": build_result_text(result)}]
+    url = year_chart_url(result.appraisal)
+    if url:
+        msgs.append({"type": "image", "originalContentUrl": url, "previewImageUrl": url})
+    return msgs
 
 
 WELCOME_TEXT = (
@@ -1712,6 +1760,7 @@ function render(d){
          ${comps}
        </div>
        <div class="meta">判定根拠：${esc(res.method)}・信頼度 ${esc(res.confidence)}</div>
+       ${d.chart_url?`<img src="${esc(d.chart_url)}" alt="年別 市場価格と流通戸数" style="width:100%;margin-top:14px;border:1px solid var(--line);border-radius:8px">`:''}
      </div>
      <div class="res-foot">
        ${p.url?`<a href="${esc(p.url)}" target="_blank" rel="noopener">SUUMOで物件を見る →</a><br>`:''}
@@ -1812,6 +1861,7 @@ def _serialize(result: Result) -> dict:
     prop = result.prop
     return {
         "ok": True,
+        "chart_url": year_chart_url(ap),
         "demo": result.demo,
         "property": {
             "name": prop.name, "url": prop.url, "address": prop.address,
