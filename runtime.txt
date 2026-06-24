@@ -1,0 +1,25 @@
+# Render Blueprint（https://render.com）
+# このリポジトリを Render に接続し「Blueprint」で読み込むと、
+# 下記設定でWebサービスが自動作成されます。
+services:
+  - type: web
+    name: isoge-clone
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT
+    healthCheckPath: /healthz
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      # 最初はデモモード（サンプル事例）で起動。Web/LINEの動作確認が即できる。
+      # 国交省APIキーを設定したら DEMO_MODE を 0 にすると実データ判定になる。
+      - key: DEMO_MODE
+        value: "1"
+      # 値は Render の管理画面で各自入力（リポジトリには保存されない）
+      - key: REINFOLIB_API_KEY
+        sync: false
+      - key: LINE_CHANNEL_SECRET
+        sync: false
+      - key: LINE_CHANNEL_ACCESS_TOKEN
+        sync: false

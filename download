@@ -1,0 +1,106 @@
+"""
+割安判定ロジックとSUUMOパーサの単体テスト。
+  python -m pytest tests/ -v
+"""
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+
+import appraisal
+import reinfolib
+import suumo
+from appraisal import appraise, depreciation_factor, yen_man
+from reinfolib import Comp
+
+
+def _comp(unit_price, area=60, age=15, deal=True):
+    return Comp(unit_price=unit_price, trade_price=int(unit_price * area), area=area,
+                age=age, building_year=2025 - age, floor_plan="3LDK", district="豊洲",
+                station="豊洲", walk_min=8, period="2024年第2四半期",
+                structure="ＲＣ", is_deal=deal)
+
+
+# ---- フォーマット ----
+def test_yen_man():
+    assert yen_man(68_000_000) == "6,800万円"
+    assert yen_man(128_000_000) == "1億2,800万円"
+    assert yen_man(100_000_000) == "1億円"
+    assert yen_man(None) == "—"
+
+
+def test_depreciation_monotonic():
+    # 築年が増えるほど係数は下がる（単調減少）
+    facs = [depreciation_factor(a) for a in range(0, 50, 5)]
+    assert all(facs[i] >= facs[i + 1] for i in range(len(facs) - 1))
+    assert 0.45 <= min(facs) <= max(facs) <= 1.05
+
+
+# ---- 価格パース ----
+def test_suumo_price_parse():
+    assert suumo._parse_price_yen("5,480万円") == 54_800_000
+    assert suumo._parse_price_yen("1億2,800万円") == 128_000_000
+    assert suumo._parse_price_yen("9800万円") == 98_000_000
+
+
+def test_suumo_area_built_floor():
+    assert suumo._parse_area("68.5m²") == 68.5
+    assert suumo._parse_built("2009年3月") == (2009, 3)
+    assert suumo._parse_built("平成21年3月") == (2009, 3)
+    assert suumo._parse_floor("12階/15階建") == 12
+
+
+def test_west_year():
+    assert reinfolib._to_west_year("平成20年") == 2008
+    assert reinfolib._to_west_year("2008年") == 2008
+    assert reinfolib._to_west_year("令和元年") == 2019
+
+
+# ---- 判定ロジック ----
+def test_cheap_property_gets_good_grade():
+    # 相場㎡100万円のエリアで、68㎡を5,000万円（㎡73万円）→ 割安
+    comps = [_comp(1_000_000, area=60 + i % 20, age=10 + i % 15) for i in range(30)]
+    ap = appraise(area_m2=68, age=15, asking_price=50_000_000, comps=comps)
+    assert ap.ok
+    assert ap.grade in ("A", "B")
+    assert ap.discount_pct > 0          # 割安方向
+
+
+def test_expensive_property_gets_bad_grade():
+    comps = [_comp(1_000_000, area=60 + i % 20, age=10 + i % 15) for i in range(30)]
+    # 68㎡を9,500万円（㎡140万円）→ 割高
+    ap = appraise(area_m2=68, age=15, asking_price=95_000_000, comps=comps)
+    assert ap.ok
+    assert ap.grade in ("D", "E")
+    assert ap.discount_pct < 0
+
+
+def test_fair_property_is_C():
+    comps = [_comp(1_000_000, area=60 + i % 20, age=15) for i in range(30)]
+    ap = appraise(area_m2=68, age=15, asking_price=68_000_000, comps=comps)
+    assert ap.ok
+    # 推定相場 ≒ 6,800万 に対して 6,800万 → ほぼ適正
+    assert ap.grade == "C"
+
+
+def test_insufficient_comps():
+    ap = appraise(area_m2=68, age=15, asking_price=68_000_000, comps=[_comp(1e6)])
+    assert not ap.ok
+    assert "不足" in ap.message
+
+
+def test_older_property_estimated_cheaper():
+    # 築年で㎡単価が下がる現実的な事例。古い物件ほど推定相場は下がるはず
+    comps = [_comp(1_300_000 - a * 15_000, area=65, age=a) for a in range(5, 35)]
+    young = appraise(area_m2=65, age=8, asking_price=70_000_000, comps=comps)
+    old = appraise(area_m2=65, age=30, asking_price=70_000_000, comps=comps)
+    assert young.estimated_price > old.estimated_price
+
+
+def test_mock_pipeline():
+    # サンプル事例データでひと通り動く
+    comps = reinfolib.fetch_comps("13108", use_mock=True)
+    assert len(comps) > 10
+    ap = appraise(area_m2=68, age=16, asking_price=60_000_000, comps=comps)
+    assert ap.ok
+    assert ap.estimated_price

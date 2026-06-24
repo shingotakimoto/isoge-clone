@@ -1,0 +1,173 @@
+# ISOGE! クローン — マンション割安判定サービス
+
+SUUMOの中古マンションURLから、周辺の **実取引・成約価格**（国土交通省データ）をもとに
+「割安／割高」を判定するサービスのプロトタイプです。
+**LINE Bot** と **Webアプリ** の2つの入口を、1つのバックエンドで提供します。
+
+> 本家 [ISOGE!](https://isoge.me/) と同等の体験（SUUMOリンク → 割安度・推定相場・成約事例）を、
+> 公開APIで再現した学習・検証用の実装です。
+
+---
+
+## 何ができるか
+
+1. ユーザーが中古マンションの **SUUMO URL** を送る（LINE / Web）
+2. ページから 価格・専有面積・築年・所在地・間取り を取得
+3. 所在地の市区町村で、国交省の **取引価格・成約価格** を照会
+4. 築年で㎡単価を補正して **推定相場** を算出
+5. 売出価格と比較して **割安度を A〜E で判定**＋**周辺の成約事例**を提示
+
+判定結果の例（デモ）:
+
+```
+割安度   : B（割安）   信頼度 高
+売出価格 : 5,280万円
+推定相場 : 5,760万円（5,160万〜6,360万）
+判定     : 相場より 480万円 割安（▼8%）
+根拠     : 築年回帰（29件）・事例38件 うち成約28件
+```
+
+---
+
+## ファイル構成
+
+```
+isoge-line-bot/
+├── app.py            … Flask本体（LINE Webhook + Web + JSON API）
+├── service.py        … 解析→照会→推定→判定をまとめるサービス層
+├── suumo.py          … SUUMO物件ページの解析
+├── reinfolib.py      … 国交省 不動産情報ライブラリAPI クライアント
+├── appraisal.py      … 相場推定・割安判定ロジック（純Python）
+├── line_flex.py      … LINEのFlex Message（判定カード）生成
+├── templates/index.html … Web版UI（ISOGE!風デザイン）
+├── cli.py            … LINE/Web無しでロジックを試すCLI
+├── sample_comps.json … デモ用サンプル成約データ
+├── tests/            … 単体テスト（pytest）
+├── requirements.txt
+└── .env.example
+```
+
+---
+
+## セットアップ
+
+### 1. 依存をインストール
+
+```bash
+cd isoge-line-bot
+python -m venv venv && source venv/bin/activate   # Windowsは venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+### 2. すぐ動かして試す（キー不要・デモモード）
+
+```bash
+# CLIでロジックだけ確認
+python cli.py --demo
+
+# Web版をデモモードで起動 → http://localhost:5000 を開き「サンプル物件で試す」
+DEMO_MODE=1 python app.py        # Windows(PowerShell): $env:DEMO_MODE=1; python app.py
+```
+
+### 3. 本番用のキーを取得
+
+| キー | 取得先 | 備考 |
+|------|--------|------|
+| `REINFOLIB_API_KEY` | [不動産情報ライブラリ API利用申請](https://www.reinfolib.mlit.go.jp/api/request/) | **無料**・発行まで**約5営業日**。先に申請推奨 |
+| `LINE_CHANNEL_SECRET` / `LINE_CHANNEL_ACCESS_TOKEN` | [LINE Developers](https://developers.line.biz/) | Messaging APIチャネルを作成して取得 |
+
+`.env.example` をコピーして `.env` を作り、値を設定:
+
+```bash
+cp .env.example .env
+# .env を編集してキーを記入
+```
+
+---
+
+## Web版の起動
+
+```bash
+# .env を読み込んで起動（python-dotenvを利用する場合）
+export $(grep -v '^#' .env | xargs)   # もしくは各ホスティングの環境変数機能で設定
+python app.py
+```
+
+ブラウザで `http://localhost:5000` を開き、SUUMOの物件URLを貼り付けて「判定する」。
+
+---
+
+## LINE Bot版のセットアップ
+
+1. **LINE Developers** でプロバイダー → **Messaging API チャネル**を作成
+2. 「チャネル基本設定」→ **チャネルシークレット** を `LINE_CHANNEL_SECRET` へ
+3. 「Messaging API設定」→ **チャネルアクセストークン（長期）** を発行し `LINE_CHANNEL_ACCESS_TOKEN` へ
+4. 同画面で **応答メッセージ＝オフ / Webhook＝オン** に設定
+5. サーバーを公開し、Webhook URL を `https://<あなたのドメイン>/callback` に設定 → 「検証」
+6. LINEで友だち追加し、SUUMOのURLを送信すると割安判定カードが返ります
+
+### ローカルで試す（ngrok）
+
+```bash
+python app.py                 # :5000 で起動
+ngrok http 5000               # 別ターミナル。発行URL + /callback をWebhookに設定
+```
+
+### デプロイ（例）
+
+- **Render / Railway / Fly.io / Cloud Run** などにそのまま載ります
+- 本番起動コマンド例: `gunicorn app:app --bind 0.0.0.0:$PORT`
+- 環境変数に `LINE_CHANNEL_SECRET` / `LINE_CHANNEL_ACCESS_TOKEN` / `REINFOLIB_API_KEY` を設定
+
+---
+
+## 割安判定ロジック（appraisal.py）
+
+1. 同一市区町村の中古マンション事例を取得（**成約価格を優先**、不足分は取引価格で補完）
+2. ㎡単価の **外れ値をIQRで除去**
+3. 対象の築年における推定㎡単価を算出
+   - 事例が十分（12件以上）→ `単価 = b0 + b1×築年` の **最小二乗回帰**で予測
+   - 少ない → **類似事例の中央値 × 築年補正係数**
+4. `推定相場 = 推定㎡単価 × 専有面積`
+5. `売出価格 ÷ 推定相場` で判定
+
+| グレード | 売出/推定 | 意味 |
+|---|---|---|
+| **A** | ≤0.85 | 非常に割安 |
+| **B** | ≤0.93 | 割安 |
+| **C** | ≤1.02 | ほぼ適正 |
+| **D** | ≤1.12 | やや割高 |
+| **E** | >1.12 | 割高 |
+
+信頼度は事例件数とばらつき（変動係数）から自動算出します。
+
+---
+
+## テスト
+
+```bash
+python -m pytest tests/ -v
+```
+
+ロジック（価格パース・和暦変換・割安/割高判定・築年による推定差）を検証します。
+
+---
+
+## ⚠️ 重要な注意
+
+- **SUUMOの自動取得（スクレイピング）は同サイトの利用規約に抵触する可能性があります。**
+  本番運用ではSUUMO（リクルート）の許諾、または公式に提供されるデータの利用を検討してください。
+  `suumo.py` は解析部を差し替え可能・低頻度アクセス前提・手入力フォールバック付きで実装しています。
+- 国交省の取引価格情報は **アンケート回収分（回収率 約3割）** のため、
+  地方や取引の少ないエリアでは事例が不足し判定できないことがあります。
+- 成約価格情報は **2021年以降** のみ提供されます。
+- 本サービスの判定は **推定値** であり、割安判定が出ても利益を保証するものではありません。
+  実際の購入判断は、個別条件（階・向き・管理状態・リフォーム等）も含め総合的に行ってください。
+- **データ出典: 国土交通省 不動産情報ライブラリ**（[利用規約](https://www.reinfolib.mlit.go.jp/help/termsOfUse/)を確認のこと）
+
+---
+
+## ライセンス / クレジット
+
+学習・検証用プロトタイプ。データ出典は国土交通省 不動産情報ライブラリ。
+デザインの着想は [ISOGE!](https://isoge.me/)。
