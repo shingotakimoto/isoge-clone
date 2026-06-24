@@ -1,7 +1,6 @@
 from __future__ import annotations
 # =====================================================================
-# ISOGE! クローン — 単一ファイル版（Render等にそのまま載せられる）
-#   SUUMO解析 → 国交省API照会 → 相場推定 → 割安判定 → Web/LINE出力
+# VALUE SCAN — 単一ファイル版（SUUMO解析→国交省照会→相場推定→Web/LINE出力）
 #   ※APIキー未設定なら自動でデモ動作（サンプル事例）
 # =====================================================================
 import base64, hashlib, hmac, json, os, math, re, statistics, datetime
@@ -1167,49 +1166,43 @@ def fetch_property(url: str) -> Property:
     return parse_property(fetch_html(url), url)
 
 """
-相場推定と割安判定ロジック。
+相場推定と割安判定ロジック（VALUE SCAN）。
 
-考え方:
-  1. 対象マンションと同一市区町村の中古マンション成約・取引事例(Comp)を集める
-  2. 外れ値（IQR）を除去
-  3. 築年で㎡単価を補正して「対象の築年における推定㎡単価」を求める
-       - 事例が十分あれば 単価 = b0 + b1*築年 の最小二乗回帰
-       - 少なければ 類似事例の中央値 × 築年補正係数
-  4. 推定㎡単価 × 専有面積 = 推定相場価格
-  5. 売出価格 ÷ 推定相場 = 割安率 → グレード(A〜E)
-
-純Pythonのみ（numpy不要）。データ出典は国土交通省の取引・成約価格情報。
+  1. 同一市区町村の中古マンション事例(Comp)を集める
+  2. 外れ値(IQR)除去
+  3. 築年で㎡単価を補正して現時点の推定㎡単価を算出
+  4. 推定㎡単価 × 専有面積 = 現時点の相場価格
+  5. 事例の年次トレンドから年次価格騰落率を求め、1年後の相場を予測
+  6. 売出価格 ÷ 相場 → 割安度 S>A>B>C>D>E>F
+純Pythonのみ。データ出典は国土交通省の取引・成約価格情報。
 """
 
 
 import math
+import re
 import statistics
 from dataclasses import dataclass, field
 from typing import Optional
 
 
-MIN_FOR_REGRESSION = 12     # これ以上なら回帰を使う
-MIN_COMPS = 4               # これ未満なら判定不能
+MIN_FOR_REGRESSION = 12
+MIN_COMPS = 4
+TSUBO = 3.305785        # 1坪 = 3.305785 m2
 
 
-# --------------------------------------------------------------------------- #
-# 統計ヘルパ（純Python）
-# --------------------------------------------------------------------------- #
-
-def _quantile(xs: list[float], q: float) -> float:
+# ---- 統計ヘルパ ----
+def _quantile(xs, q):
     if not xs:
         return 0.0
     s = sorted(xs)
     pos = (len(s) - 1) * q
-    lo = math.floor(pos)
-    hi = math.ceil(pos)
+    lo, hi = math.floor(pos), math.ceil(pos)
     if lo == hi:
         return s[int(pos)]
     return s[lo] + (s[hi] - s[lo]) * (pos - lo)
 
 
-def _iqr_filter(comps: list[Comp]) -> list[Comp]:
-    """㎡単価のIQRで外れ値を除去。"""
+def _iqr_filter(comps):
     prices = [c.unit_price for c in comps]
     if len(prices) < 4:
         return comps
@@ -1219,78 +1212,68 @@ def _iqr_filter(comps: list[Comp]) -> list[Comp]:
     return [c for c in comps if lo <= c.unit_price <= hi]
 
 
-def _linregress(xs: list[float], ys: list[float]) -> Optional[tuple[float, float]]:
-    """最小二乗で y = b0 + b1*x の (b0, b1) を返す。分散ゼロならNone。"""
+def _linregress(xs, ys):
     n = len(xs)
     if n < 3:
         return None
-    mx = sum(xs) / n
-    my = sum(ys) / n
+    mx, my = sum(xs) / n, sum(ys) / n
     sxx = sum((x - mx) ** 2 for x in xs)
     if sxx == 0:
         return None
     sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
     b1 = sxy / sxx
-    b0 = my - b1 * mx
-    return b0, b1
+    return my - b1 * mx, b1
 
 
-# 築年補正係数（フォールバック用の一般的な中古マンション減価カーブ）
-def depreciation_factor(age: Optional[int]) -> float:
+def depreciation_factor(age):
     if age is None:
         age = 25
     age = max(0, age)
-    if age <= 30:
-        f = 1.0 - 0.013 * age          # 〜30年: 約1.3%/年
-    else:
-        f = (1.0 - 0.013 * 30) - 0.004 * (age - 30)  # 以降は緩やか
+    f = (1.0 - 0.013 * age) if age <= 30 else (1.0 - 0.013 * 30) - 0.004 * (age - 30)
     return max(0.45, min(1.05, f))
 
 
-# --------------------------------------------------------------------------- #
-# 結果
-# --------------------------------------------------------------------------- #
+def _comp_year(c):
+    m = re.search(r"(19|20)\d{2}", c.period or "")
+    return int(m.group()) if m else None
 
+
+def _annual_rate(comps, est_unit):
+    """事例の取引年から㎡単価の年次騰落率(小数)を推定。-10%〜+15%でクランプ。"""
+    pts = [(y, c.unit_price) for c in comps if (y := _comp_year(c))]
+    if len({y for y, _ in pts}) < 2 or len(pts) < 6:
+        return 0.0
+    reg = _linregress([y for y, _ in pts], [u for _, u in pts])
+    if not reg:
+        return 0.0
+    _, b1 = reg
+    base = est_unit or statistics.fmean([u for _, u in pts])
+    if not base:
+        return 0.0
+    return max(-0.10, min(0.15, b1 / base))
+
+
+# ---- 割安度グレード（売出÷相場：小さいほど割安）----
 GRADES = [
-    # (上限ratio, grade, ラベル, 色)
-    (0.85, "A", "非常に割安", "#1aa260"),
-    (0.93, "B", "割安",       "#3ac17a"),
-    (1.02, "C", "ほぼ適正",   "#2b8cd9"),
-    (1.12, "D", "やや割高",   "#e8943a"),
-    (9.99, "E", "割高",       "#d9534f"),
+    (0.85, "S", "急げ！",     "#16a085"),
+    (0.92, "A", "とても割安", "#1aa260"),
+    (0.98, "B", "割安",       "#3ac17a"),
+    (1.06, "C", "相場水準",   "#2b8cd9"),
+    (1.14, "D", "やや割高",   "#e8943a"),
+    (1.22, "E", "割高",       "#e0663a"),
+    (9.99, "F", "スケベ価格", "#d9534f"),
 ]
+GRADE_LEGEND = "S(急げ！) > A > B > C(相場水準) > D > E > F(スケベ価格)"
 
 
-@dataclass
-class Appraisal:
-    ok: bool
-    message: str = ""
-    estimated_unit_price: Optional[float] = None   # 推定㎡単価（円/㎡）
-    estimated_price: Optional[int] = None          # 推定相場（円）
-    price_low: Optional[int] = None                # 推定レンジ下限
-    price_high: Optional[int] = None               # 推定レンジ上限
-    asking_price: Optional[int] = None             # 売出価格
-    ratio: Optional[float] = None                  # 売出 ÷ 推定
-    diff_yen: Optional[int] = None                 # 売出 − 推定（負=割安）
-    discount_pct: Optional[float] = None           # 割安率(%) 正=割安
-    grade: Optional[str] = None
-    grade_label: str = ""
-    grade_color: str = ""
-    confidence: str = ""                           # 高 / 中 / 低
-    n_comps: int = 0
-    n_deals: int = 0
-    method: str = ""
-    representative: list[Comp] = field(default_factory=list)
-
-
-def _grade_for(ratio: float) -> tuple[str, str, str]:
+def _grade_for(ratio):
     for upper, g, label, color in GRADES:
         if ratio <= upper:
             return g, label, color
-    return "E", "割高", "#d9534f"
+    return "F", "スケベ価格", "#d9534f"
 
 
-def _confidence(n: int, cv: float) -> str:
+def _confidence(n, cv):
     if n >= 20 and cv <= 0.28:
         return "高"
     if n >= 8 and cv <= 0.45:
@@ -1298,29 +1281,49 @@ def _confidence(n: int, cv: float) -> str:
     return "低"
 
 
-def _similar(comps: list[Comp], age: Optional[int], area: Optional[float]) -> list[Comp]:
-    """築年±15年・面積±50%で類似事例を抽出（足りなければ緩める）。"""
-    def near(c: Comp) -> bool:
+def _similar(comps, age, area):
+    def near(c):
         if age is not None and c.age is not None and abs(c.age - age) > 15:
             return False
         if area and c.area and not (0.5 * area <= c.area <= 1.6 * area):
             return False
         return True
-
     narrowed = [c for c in comps if near(c)]
     return narrowed if len(narrowed) >= MIN_COMPS else comps
 
 
-# --------------------------------------------------------------------------- #
-# メイン
-# --------------------------------------------------------------------------- #
+@dataclass
+class Appraisal:
+    ok: bool
+    message: str = ""
+    estimated_unit_price: Optional[float] = None   # 現時点 推定㎡単価
+    estimated_price: Optional[int] = None          # 現時点 相場（円）
+    price_low: Optional[int] = None
+    price_high: Optional[int] = None
+    asking_price: Optional[int] = None
+    asking_unit_price: Optional[float] = None       # 物件㎡単価
+    ratio: Optional[float] = None
+    diff_yen: Optional[int] = None
+    discount_pct: Optional[float] = None
+    grade: Optional[str] = None                     # 現時点グレード
+    grade_label: str = ""
+    grade_color: str = ""
+    expected_profit: Optional[int] = None           # 現時点 期待利益(相場−売出)
+    annual_rate: float = 0.0                         # 年次価格騰落率(小数)
+    future_unit_price: Optional[float] = None        # 1年後 推定㎡単価
+    future_price: Optional[int] = None               # 1年後 相場
+    future_grade: Optional[str] = None
+    future_grade_label: str = ""
+    future_grade_color: str = ""
+    future_profit: Optional[int] = None              # 1年後 期待利益
+    confidence: str = ""
+    n_comps: int = 0
+    n_deals: int = 0
+    method: str = ""
+    representative: list = field(default_factory=list)
 
-def appraise(
-    area_m2: Optional[float],
-    age: Optional[int],
-    asking_price: Optional[int],
-    comps: list[Comp],
-) -> Appraisal:
+
+def appraise(area_m2, age, asking_price, comps):
     if not area_m2 or not asking_price:
         return Appraisal(ok=False, message="専有面積または売出価格が不明です。")
 
@@ -1328,21 +1331,17 @@ def appraise(
     n_deals = sum(1 for c in comps if c.is_deal)
     comps = _iqr_filter(comps)
     if len(comps) < MIN_COMPS:
-        return Appraisal(
-            ok=False,
-            n_comps=len(comps), n_deals=n_deals,
-            message=("周辺の取引事例が不足しているため判定できませんでした"
-                     f"（有効事例 {len(comps)} 件）。地方や事例の少ないエリアで起こりえます。"),
-        )
+        return Appraisal(ok=False, n_comps=len(comps), n_deals=n_deals,
+                         message=("周辺の取引事例が不足しているため判定できませんでした"
+                                  f"（有効事例 {len(comps)} 件）。"))
 
     used = _similar(comps, age, area_m2)
     unit_prices = [c.unit_price for c in used]
     mean_up = statistics.fmean(unit_prices)
     cv = (statistics.pstdev(unit_prices) / mean_up) if mean_up else 1.0
 
-    # --- 推定㎡単価 ---
-    est_unit = None
-    method = ""
+    # 現時点の推定㎡単価
+    est_unit, method = None, ""
     aged = [(c.age, c.unit_price) for c in used if c.age is not None]
     if len(aged) >= MIN_FOR_REGRESSION and age is not None:
         reg = _linregress([a for a, _ in aged], [u for _, u in aged])
@@ -1351,65 +1350,54 @@ def appraise(
             pred = b0 + b1 * age
             lo = _quantile([u for _, u in aged], 0.05)
             hi = _quantile([u for _, u in aged], 0.95)
-            if b1 <= 0 and lo <= pred <= hi:   # 妥当（古いほど安い）な場合のみ採用
-                est_unit = pred
-                method = f"築年回帰（{len(aged)}件）"
-
+            if b1 <= 0 and lo <= pred <= hi:
+                est_unit, method = pred, f"築年回帰（{len(aged)}件）"
     if est_unit is None:
-        # フォールバック: 類似事例の中央値を築年補正
         med_up = statistics.median(unit_prices)
         ages = [c.age for c in used if c.age is not None]
         base_age = statistics.median(ages) if ages else 25
-        adj = depreciation_factor(age) / depreciation_factor(int(base_age))
-        est_unit = med_up * adj
+        est_unit = med_up * (depreciation_factor(age) / depreciation_factor(int(base_age)))
         method = f"類似中央値×築年補正（{len(used)}件）"
 
     estimated_price = int(est_unit * area_m2)
-
-    # --- 割安判定 ---
     ratio = asking_price / estimated_price
     grade, label, color = _grade_for(ratio)
-    diff = asking_price - estimated_price
-    discount = (1 - ratio) * 100
-
     band = max(0.08, min(0.25, cv * 0.8))
-    confidence = _confidence(len(used), cv)
 
-    # --- 代表的な成約事例（類似順 上位5件） ---
-    def sim_key(c: Comp):
-        da = abs((c.age or 999) - (age or 0))
-        dar = abs((c.area or 0) - area_m2)
-        return (0 if c.is_deal else 1, da, dar)
+    # 年次騰落率 → 1年後予測
+    rate = _annual_rate(comps, est_unit)
+    future_unit = est_unit * (1 + rate)
+    future_price = int(future_unit * area_m2)
+    fratio = asking_price / future_price
+    fgrade, flabel, fcolor = _grade_for(fratio)
 
+    def sim_key(c):
+        return (0 if c.is_deal else 1, abs((c.age or 999) - (age or 0)),
+                abs((c.area or 0) - area_m2))
     representative = sorted(used, key=sim_key)[:5]
 
     return Appraisal(
         ok=True,
-        estimated_unit_price=est_unit,
-        estimated_price=estimated_price,
+        estimated_unit_price=est_unit, estimated_price=estimated_price,
         price_low=int(estimated_price * (1 - band)),
         price_high=int(estimated_price * (1 + band)),
-        asking_price=asking_price,
-        ratio=ratio,
-        diff_yen=diff,
-        discount_pct=discount,
-        grade=grade,
-        grade_label=label,
-        grade_color=color,
-        confidence=confidence,
-        n_comps=len(comps),
-        n_deals=n_deals,
-        method=method,
+        asking_price=asking_price, asking_unit_price=asking_price / area_m2,
+        ratio=ratio, diff_yen=asking_price - estimated_price,
+        discount_pct=(1 - ratio) * 100,
+        grade=grade, grade_label=label, grade_color=color,
+        expected_profit=estimated_price - asking_price,
+        annual_rate=rate,
+        future_unit_price=future_unit, future_price=future_price,
+        future_grade=fgrade, future_grade_label=flabel, future_grade_color=fcolor,
+        future_profit=future_price - asking_price,
+        confidence=_confidence(len(used), cv),
+        n_comps=len(comps), n_deals=n_deals, method=method,
         representative=representative,
     )
 
 
-# --------------------------------------------------------------------------- #
-# 表示用フォーマット
-# --------------------------------------------------------------------------- #
-
-def yen_man(yen: Optional[int]) -> str:
-    """円 → 「○,○○○万円」/「○億○,○○○万円」"""
+# ---- 表示用 ----
+def yen_man(yen):
     if yen is None:
         return "—"
     man = round(yen / 1_0000)
@@ -1417,6 +1405,21 @@ def yen_man(yen: Optional[int]) -> str:
         oku, rest = divmod(man, 1_0000)
         return f"{oku}億{rest:,}万円" if rest else f"{oku}億円"
     return f"{man:,}万円"
+
+
+def tsubo_man(unit_price_m2):
+    """㎡単価(円) → 坪単価表示「○○万円」"""
+    if not unit_price_m2:
+        return "—"
+    return yen_man(int(unit_price_m2 * TSUBO))
+
+
+def profit_str(yen):
+    """期待利益：+○○万円 / ▲○○万円"""
+    if yen is None:
+        return "—"
+    man = round(abs(yen) / 1_0000)
+    return f"+{man:,}万円" if yen >= 0 else f"▲{man:,}万円"
 
 from dataclasses import dataclass
 from typing import Optional
@@ -1475,143 +1478,52 @@ def _appraise(prop, use_mock=False, demo=False):
         return Result(ok=False, prop=prop, city_name=city_name, appraisal=ap, message=ap.message, demo=demo)
     return Result(ok=True, prop=prop, appraisal=ap, city_name=city_name, demo=demo)
 
-"""
-LINE Flex Message（割安判定カード）の組み立て。
-Result から LINE の messages 配列を作る。
-"""
+"""LINE返信メッセージ（VALUE SCAN）。判定結果を詳細テキストで返す。"""
 
 
-
-
-def _row(label: str, value: str, value_color: str = "#333333", bold: bool = False) -> dict:
-    return {
-        "type": "box", "layout": "baseline", "spacing": "sm",
-        "contents": [
-            {"type": "text", "text": label, "size": "sm", "color": "#888888", "flex": 4},
-            {"type": "text", "text": value, "size": "sm", "color": value_color,
-             "flex": 6, "weight": "bold" if bold else "regular", "wrap": True, "align": "end"},
-        ],
-    }
-
-
-def build_result_flex(result: Result) -> dict:
-    prop = result.prop
+def build_result_text(result):
     ap = result.appraisal
-    name = (prop.name if prop else "物件")[:34]
-
-    # ---- ヘッダ（グレード色） ----
-    header = {
-        "type": "box", "layout": "vertical", "backgroundColor": ap.grade_color,
-        "paddingAll": "16px", "spacing": "xs",
-        "contents": [
-            {"type": "text", "text": "VALUE SCAN 割安度判定", "color": "#ffffffcc", "size": "xs"},
-            {"type": "text", "text": name, "color": "#ffffff", "size": "md",
-             "weight": "bold", "wrap": True},
-            {"type": "box", "layout": "baseline", "spacing": "md", "margin": "md",
-             "contents": [
-                 {"type": "text", "text": ap.grade, "color": "#ffffff", "size": "4xl",
-                  "weight": "bold", "flex": 0},
-                 {"type": "text", "text": ap.grade_label, "color": "#ffffff", "size": "lg",
-                  "weight": "bold", "gravity": "center"},
-             ]},
-        ],
-    }
-
-    # ---- 差額表現 ----
-    if ap.discount_pct >= 0:
-        diff_text = f"相場より {yen_man(abs(ap.diff_yen))} 割安（▼{ap.discount_pct:.0f}%）"
-        diff_color = "#1aa260"
-    else:
-        diff_text = f"相場より {yen_man(abs(ap.diff_yen))} 割高（▲{abs(ap.discount_pct):.0f}%）"
-        diff_color = "#d9534f"
-
-    body_contents = [
-        _row("売出価格", yen_man(ap.asking_price), "#111111", bold=True),
-        _row("推定相場", yen_man(ap.estimated_price), "#111111", bold=True),
-        _row("推定レンジ", f"{yen_man(ap.price_low)}〜{yen_man(ap.price_high)}"),
-        {"type": "box", "layout": "vertical", "margin": "md", "paddingAll": "10px",
-         "backgroundColor": "#f3faf5" if ap.discount_pct >= 0 else "#fdf2f2",
-         "cornerRadius": "8px",
-         "contents": [
-             {"type": "text", "text": diff_text, "size": "sm", "weight": "bold",
-              "color": diff_color, "wrap": True, "align": "center"},
-         ]},
-        {"type": "separator", "margin": "lg"},
-    ]
-
-    # ---- 物件スペック ----
-    specs = []
-    if prop:
-        if prop.area_m2:
-            specs.append(_row("専有面積", f"{prop.area_m2:.0f}㎡"))
-        if prop.floor_plan:
-            specs.append(_row("間取り", prop.floor_plan))
-        if prop.age is not None:
-            specs.append(_row("築年数", f"築{prop.age}年（{prop.built_year}年）"))
-        loc = result.city_name or ""
-        if loc:
-            specs.append(_row("エリア", loc))
-    body_contents += specs
-    body_contents.append({"type": "separator", "margin": "lg"})
-
-    # ---- 成約事例 ----
-    body_contents.append(
-        {"type": "text", "text": f"周辺の取引・成約事例（{ap.n_comps}件中）",
-         "size": "sm", "weight": "bold", "color": "#2b8cd9", "margin": "md"})
-    for c in ap.representative[:3]:
-        tag = "成約" if c.is_deal else "取引"
-        area = f"{c.area:.0f}㎡" if c.area else "—"
-        age = f"築{c.age}" if c.age is not None else ""
-        line = f"[{tag}] {yen_man(c.trade_price)} / {area} {age} / {c.station or c.district}"
-        body_contents.append(
-            {"type": "text", "text": line, "size": "xs", "color": "#555555",
-             "wrap": True, "margin": "sm"})
-
-    body_contents.append(
-        {"type": "text",
-         "text": f"判定根拠: {ap.method}・信頼度 {ap.confidence}",
-         "size": "xxs", "color": "#aaaaaa", "margin": "md", "wrap": True})
-
-    body = {"type": "box", "layout": "vertical", "paddingAll": "16px",
-            "spacing": "sm", "contents": body_contents}
-
-    # ---- フッタ ----
-    footer_contents = []
-    if prop and prop.url:
-        footer_contents.append({
-            "type": "button", "style": "primary", "height": "sm",
-            "color": ap.grade_color,
-            "action": {"type": "uri", "label": "SUUMOで物件を見る", "uri": prop.url},
-        })
-    footer_contents.append({
-        "type": "text",
-        "text": "推定値です。実際の価値は個別条件で変動します。データ出典: 国土交通省",
-        "size": "xxs", "color": "#aaaaaa", "wrap": True, "margin": "sm"})
-    footer = {"type": "box", "layout": "vertical", "paddingAll": "12px",
-            "spacing": "sm", "contents": footer_contents}
-
-    bubble = {"type": "bubble", "size": "mega",
-            "header": header, "body": body, "footer": footer}
-
-    return {
-        "type": "flex",
-        "altText": f"{name} の割安度: {ap.grade}（{ap.grade_label}）",
-        "contents": bubble,
-    }
+    p = result.prop
+    name = p.name if p else "物件"
+    area = f"{p.area_m2:.2f}㎡" if (p and p.area_m2) else "—"
+    return "\n".join([
+        "【物件情報】",
+        f"・物件名: {name}",
+        f"・物件価格: {yen_man(ap.asking_price)}",
+        f"・物件坪単価: {tsubo_man(ap.asking_unit_price)}",
+        f"・専有面積: {area}",
+        f"・年次価格騰落率: {ap.annual_rate * 100:+.1f}%",
+        "",
+        "【現時点】",
+        f"・割安度: {ap.grade}",
+        f"・相場物件価格: {yen_man(ap.estimated_price)}",
+        f"・相場坪単価: {tsubo_man(ap.estimated_unit_price)}",
+        f"・期待利益: {profit_str(ap.expected_profit)}",
+        "",
+        "【将来予測(1年後)】",
+        f"・割安度: {ap.future_grade}",
+        f"・相場物件価格: {yen_man(ap.future_price)}",
+        f"・相場坪単価: {tsubo_man(ap.future_unit_price)}",
+        f"・期待利益: {profit_str(ap.future_profit)}",
+        "",
+        f"※割安度: {GRADE_LEGEND}",
+    ])
 
 
-def build_messages(result: Result) -> list[dict]:
-    """成功時はFlex、失敗時はテキストを返す。"""
+def build_messages(result):
     if result.ok:
-        return [build_result_flex(result)]
+        return [{"type": "text", "text": build_result_text(result)}]
     return [{"type": "text", "text": "⚠️ " + (result.message or "判定できませんでした。")}]
 
 
 WELCOME_TEXT = (
-    "VALUE SCANへようこそ🏢\n\n"
-    "気になる中古マンションの【SUUMOのURL】をそのまま送ってください。\n"
-    "周辺の取引・成約事例から、割安/割高度を判定します。\n\n"
-    "※判定は推定値です。データ出典: 国土交通省 不動産情報ライブラリ"
+    "はじめまして！VALUE SCANです。\n"
+    "友だち追加ありがとうございます😊\n\n"
+    "VALUE SCANは中古マンションの割安度判定ができるサービスです。\n"
+    "気になる物件のURL（現在はSUUMOのみ対応）を送ってください！\n"
+    "10秒程度で判定結果をお返しします。\n"
+    "もし結果が返ってこない場合は、お手数ですが再送ください。\n\n"
+    "※判定は国土交通省の公開取引データに基づく推定値であり、結果を保証するものではありません。"
 )
 
 INDEX_HTML = r'''<!DOCTYPE html>
