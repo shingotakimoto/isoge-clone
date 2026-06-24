@@ -863,6 +863,9 @@ def _row_to_comp(row: dict) -> Optional[Comp]:
     )
 
 
+_COMPS_CACHE = {}
+
+
 def fetch_comps(
     city_code: str,
     years: Optional[list[int]] = None,
@@ -878,6 +881,9 @@ def fetch_comps(
     if use_mock:
         return _load_mock_comps()
 
+    default_years = years is None
+    if default_years and city_code in _COMPS_CACHE:
+        return _COMPS_CACHE[city_code]
     if years is None:
         this_year = _dt.now().year
         years = list(range(this_year, this_year - 5, -1))  # 直近5年
@@ -889,7 +895,8 @@ def fetch_comps(
         if y < 2021:
             continue
         body = _request("XIT001", {
-            "year": str(y), "city": city_code, "priceClassification": PRICE_DEAL,
+            "year": str(y), "area": city_code[:2], "city": city_code,
+            "priceClassification": PRICE_DEAL,
         })
         for row in body.get("data", []):
             c = _row_to_comp(row)
@@ -901,13 +908,16 @@ def fetch_comps(
     if include_trade and len(comps) < 15:
         for y in years:
             body = _request("XIT001", {
-                "year": str(y), "city": city_code, "priceClassification": PRICE_TRADE,
+                "year": str(y), "area": city_code[:2], "city": city_code,
+                "priceClassification": PRICE_TRADE,
             })
             for row in body.get("data", []):
                 c = _row_to_comp(row)
                 if c:
                     comps.append(c)
 
+    if default_years:
+        _COMPS_CACHE[city_code] = comps
     return comps
 
 
@@ -1719,6 +1729,28 @@ def _appraise(prop, use_mock=False, demo=False):
     return Result(ok=True, prop=prop, appraisal=ap, city_name=city_name, demo=demo)
 
 
+def _result_item(ap, prop):
+    return {
+        "name": prop.name, "url": prop.url, "grade": ap.grade,
+        "grade_label": ap.grade_label, "grade_color": ap.grade_color,
+        "price_man": yen_man(ap.asking_price),
+        "market_man": yen_man(ap.estimated_price),
+        "range_man": f"{yen_man(ap.price_low)}\u301c{yen_man(ap.price_high)}",
+        "tsubo_man": tsubo_man(ap.asking_unit_price),
+        "discount_pct": round(ap.discount_pct, 1), "ratio": ap.ratio,
+        "area": prop.area_m2, "built_year": prop.built_year,
+        "future_man": yen_man(ap.future_price), "future_grade": ap.future_grade,
+        "profit_str": profit_str(ap.expected_profit),
+        "annual_pct": round(ap.annual_rate * 100, 1),
+        "method": ap.method, "confidence": ap.confidence,
+        "n_comps": ap.n_comps, "n_deals": ap.n_deals,
+        "comps": [{"tag": "成約" if c.is_deal else "取引",
+                   "price_man": yen_man(c.trade_price),
+                   "area": c.area, "age": c.age, "where": c.station or c.district}
+                  for c in ap.representative[:3]],
+    }
+
+
 def screen_listing(url, use_mock=False, limit=30):
     """検索結果ページ→各物件を判定→割安順（Sが上）に集計。"""
     try:
@@ -1754,12 +1786,7 @@ def screen_listing(url, use_mock=False, limit=30):
                                 district=_district_of(prop.address))
         if not ap.ok:
             continue
-        results.append({"name": prop.name, "url": prop.url, "grade": ap.grade,
-                        "grade_label": ap.grade_label, "grade_color": ap.grade_color,
-                        "price_man": yen_man(ap.asking_price),
-                        "market_man": yen_man(ap.estimated_price),
-                        "discount_pct": round(ap.discount_pct, 1), "ratio": ap.ratio,
-                        "area": prop.area_m2, "built_year": prop.built_year})
+        results.append(_result_item(ap, prop))
     results.sort(key=lambda r: r["ratio"])
     return {"ok": True, "scanned": len(items), "judged": len(results),
             "s_count": sum(1 for r in results if r["grade"] == "S"), "results": results}
@@ -1772,13 +1799,7 @@ def batch_judge(urls, use_mock=False, limit=30):
         r = appraise_from_url(u, use_mock=use_mock)
         if not r.ok:
             continue
-        ap, p = r.appraisal, r.prop
-        results.append({"name": p.name, "url": p.url, "grade": ap.grade,
-                        "grade_label": ap.grade_label, "grade_color": ap.grade_color,
-                        "price_man": yen_man(ap.asking_price),
-                        "market_man": yen_man(ap.estimated_price),
-                        "discount_pct": round(ap.discount_pct, 1), "ratio": ap.ratio,
-                        "area": p.area_m2, "built_year": p.built_year})
+        results.append(_result_item(r.appraisal, r.prop))
     results.sort(key=lambda r: r["ratio"])
     return {"ok": True, "judged": len(results),
             "s_count": sum(1 for r in results if r["grade"] == "S"), "results": results}
@@ -2051,13 +2072,12 @@ INDEX_HTML = r'''<!DOCTYPE html>
     <div class="badges">
       <span class="badge">登録不要</span>
       <span class="badge">回数無制限</span>
-      <span class="badge">データ出典：国土交通省</span>
     </div>
   </header>
 
   <main class="wrap">
     <section class="card">
-      <h2>SUUMOのURLで割安度をチェック</h2>
+      <h2>物件サイトのURLで割安度をチェック</h2>
       <p class="sub">中古マンションの物件ページURLを貼り付けてください（SUUMO・HOME'S・各仲介会社サイト等）。</p>
       <form id="form" class="field">
         <input id="url" type="url" placeholder="物件ページのURL（SUUMO・HOME'S 等）" autocomplete="off">
@@ -2065,7 +2085,7 @@ INDEX_HTML = r'''<!DOCTYPE html>
       </form>
       <button class="demo" id="demoBtn" type="button">▶ サンプル物件で試す（キー設定なしでOK）</button>
       <div class="steps">
-        <div class="step"><div class="n">1</div><div class="t">SUUMOのURLを貼る</div></div>
+        <div class="step"><div class="n">1</div><div class="t">物件サイトのURLを貼る</div></div>
         <div class="step"><div class="n">2</div><div class="t">周辺事例を自動収集</div></div>
         <div class="step"><div class="n">3</div><div class="t">割安度A〜Eで判定</div></div>
       </div>
@@ -2076,7 +2096,7 @@ INDEX_HTML = r'''<!DOCTYPE html>
     <section id="result"></section>
 
     <section class="card" style="margin-top:18px">
-      <h2>まとめて判定（Sランク抽出）</h2>
+      <h2>まとめて判定（ランク確認）</h2>
       <p class="sub"><b>方法1（確実・推奨）</b>：気になる物件の詳細URLを改行で複数貼り付け</p>
       <form id="bform">
         <textarea id="burls" rows="4" placeholder="https://suumo.jp/ms/chuko/.../nc_xxxxxxxx/  （改行で複数）" style="width:100%;box-sizing:border-box;padding:12px;border:1.5px solid var(--line);border-radius:10px;font-size:13px;outline:none"></textarea>
@@ -2092,19 +2112,6 @@ INDEX_HTML = r'''<!DOCTYPE html>
       <p class="note">※物件を順に判定します（最大30件・件数により時間がかかります）。ページ取得は各サイトの規約をご確認ください。実判定には国交省キーが必要です。</p>
     </section>
 
-    <section class="card" style="margin-top:18px">
-      <h2>対応サイト（目安）</h2>
-      <p class="sub">物件ページのURLを送ると判定します。取得可否はページ構造により変わります。</p>
-      <div style="font-size:14px">
-        <div class="srow"><span>SUUMO</span><b style="color:#1aa260">✅ 対応</b></div>
-        <div class="srow"><span>LIFULL HOME'S</span><b style="color:#1aa260">✅ 対応</b></div>
-        <div class="srow"><span>各仲介会社サイト<br><span style="color:#889;font-size:12px">三井のリハウス/東急リバブル/住友不動産販売/ノムコム/三菱地所ハウスネット/東京建物/大京穴吹 ほか</span></span><b style="color:#e8943a">△ ページにより対応</b></div>
-        <div class="srow"><span>ニフティ不動産</span><b style="color:#e8943a">△ 要確認</b></div>
-        <div class="srow"><span>at home</span><b style="color:#e8943a">△ 取得制限が強く不可が多い</b></div>
-        <div class="srow"><span>Yahoo!不動産</span><b style="color:#d9534f">❌ 未対応（JS描画）</b></div>
-      </div>
-      <p class="note">※ JavaScriptで表示されるサイト（Yahoo!不動産等）やアクセス制限の強いサイトは取得できません。取得できない場合は、SUUMO や HOME'S のURLをお試しください。</p>
-    </section>
   </main>
 
   <footer class="site">© VALUE SCAN（学習用プロトタイプ）<br>このサービスは、国土交通省不動産情報ライブラリのAPI機能を使用していますが、提供情報の最新性・正確性・完全性等が保証されたものではありません。</footer>
@@ -2195,49 +2202,47 @@ demoBtn.addEventListener('click', ()=> appraise({demo:true}));
 const sform=document.getElementById('sform');
 const sresult=document.getElementById('sresult');
 const sonly=document.getElementById('sonly');
+const bform=document.getElementById('bform');
 let _sdata=null;
 function thisYear(){return new Date().getFullYear();}
 function srender(){
   if(!_sdata){sresult.innerHTML='';return;}
   if(!_sdata.ok){sresult.innerHTML='<div class="err" style="margin-top:10px">\u26a0\ufe0f '+esc(_sdata.message)+'</div>';return;}
   let rows=_sdata.results||[];
-  if(sonly.checked) rows=rows.filter(r=>r.grade==='S');
-  const head='<div class="sub" style="margin:12px 0 6px">判定 '+_sdata.judged+'件 ／ Sランク '+_sdata.s_count+'件（割安順）</div>';
+  if(sonly&&sonly.checked) rows=rows.filter(r=>r.grade==='S');
+  const head='<div class="sub" style="margin:12px 0 6px">判定 '+_sdata.judged+'件（割安順）・行をクリックで判定根拠</div>';
   if(!rows.length){sresult.innerHTML=head+'<p class="sub">該当物件がありません。</p>';return;}
-  sresult.innerHTML=head+rows.map(r=>`
-    <div class="srow" style="align-items:flex-start">
-      <div style="flex:1">
-        <div><b style="color:${r.grade_color};font-size:16px">${r.grade}</b> <span style="font-size:13px">${esc(r.name)}</span></div>
-        <div style="font-size:12px;color:#889">売出 ${esc(r.price_man)} / 推定 ${esc(r.market_man)} / ${r.discount_pct>=0?'\u25bc'+r.discount_pct:'\u25b2'+Math.abs(r.discount_pct)}% ${r.area?'/ '+Math.round(r.area)+'\u33a1':''} ${r.built_year?'/ 築'+(thisYear()-r.built_year)+'年':''}</div>
+  sresult.innerHTML=head+rows.map((r,i)=>{
+    const comps=(r.comps||[]).map(c=>`<div style="font-size:11px;color:#778">[${c.tag}] ${esc(c.price_man)} / ${c.area?Math.round(c.area)+'\u33a1':'\u2014'} ${c.age!=null?'築'+c.age:''} / ${esc(c.where||'')}</div>`).join('');
+    return `
+    <div class="srow" style="flex-direction:column;align-items:stretch;cursor:pointer" onclick="(function(d){d.style.display=d.style.display==='none'?'block':'none'})(document.getElementById('vd${i}'))">
+      <div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start">
+        <div style="flex:1">
+          <div><b style="color:${r.grade_color};font-size:16px">${r.grade}</b> <span style="font-size:13px">${esc(r.name)}</span></div>
+          <div style="font-size:12px;color:#889">売出 ${esc(r.price_man)} / 推定 ${esc(r.market_man)} / ${r.discount_pct>=0?'\u25bc'+r.discount_pct:'\u25b2'+Math.abs(r.discount_pct)}% ${r.area?'/ '+Math.round(r.area)+'\u33a1':''}</div>
+        </div>
+        ${r.url?`<a href="${esc(r.url)}" target="_blank" rel="noopener" style="font-size:12px;white-space:nowrap" onclick="event.stopPropagation()">見る</a>`:''}
       </div>
-      ${r.url?`<a href="${esc(r.url)}" target="_blank" rel="noopener" style="font-size:12px;white-space:nowrap">見る</a>`:''}
-    </div>`).join('');
+      <div id="vd${i}" style="display:none;margin-top:8px;padding-top:8px;border-top:1px dashed var(--line);font-size:12px;color:#556">
+        <div>推定レンジ：${esc(r.range_man)}　／　坪単価：${esc(r.tsubo_man)}</div>
+        <div>1年後予測：${esc(r.future_man)}（${r.future_grade}）　／　年間騰落率：${r.annual_pct}%　／　期待利益：${esc(r.profit_str)}</div>
+        <div style="margin-top:5px;color:#667">周辺の取引・成約事例：</div>
+        ${comps||'<div style="font-size:11px;color:#99a">\u2014</div>'}
+        <div style="margin-top:5px;color:#99a">判定根拠：${esc(r.method)}・信頼度 ${esc(r.confidence)}（事例${r.n_comps}件／成約${r.n_deals}件）</div>
+      </div>
+    </div>`;
+  }).join('');
 }
-if(sform){
-  sform.addEventListener('submit', async e=>{
-    e.preventDefault();
-    const url=document.getElementById('surl').value.trim(); if(!url) return;
-    sresult.innerHTML='<div class="loading"><div class="spinner"></div>一覧を判定しています…</div>';
-    try{
-      const r=await fetch('/api/screen',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url})});
-      _sdata=await r.json(); srender();
-    }catch(err){ sresult.innerHTML='<div class="err">通信エラーが発生しました。</div>'; }
-  });
-  sonly.addEventListener('change', srender);
+async function _post(endpoint, body, loadingMsg){
+  sresult.innerHTML='<div class="loading"><div class="spinner"></div>'+loadingMsg+'</div>';
+  try{
+    const r=await fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    _sdata=await r.json(); srender();
+  }catch(err){ sresult.innerHTML='<div class="err">通信エラーが発生しました。</div>'; }
 }
-
-const bform=document.getElementById('bform');
-if(bform){
-  bform.addEventListener('submit', async e=>{
-    e.preventDefault();
-    const urls=document.getElementById('burls').value.trim(); if(!urls) return;
-    sresult.innerHTML='<div class="loading"><div class="spinner"></div>URLをまとめて判定しています…</div>';
-    try{
-      const r=await fetch('/api/batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({urls})});
-      _sdata=await r.json(); srender();
-    }catch(err){ sresult.innerHTML='<div class="err">通信エラーが発生しました。</div>'; }
-  });
-}
+if(bform){ bform.addEventListener('submit', e=>{e.preventDefault();const u=document.getElementById('burls').value.trim();if(u)_post('/api/batch',{urls:u},'URLをまとめて判定しています…');}); }
+if(sform){ sform.addEventListener('submit', e=>{e.preventDefault();const u=document.getElementById('surl').value.trim();if(u)_post('/api/screen',{url:u},'一覧を判定しています…');}); }
+if(sonly){ sonly.addEventListener('change', srender); }
 </script>
 </body>
 </html>
