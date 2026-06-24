@@ -722,6 +722,8 @@ def _request(endpoint: str, params: dict) -> dict:
     # requests は Content-Encoding: gzip を自動デコードする
     resp = requests.get(f"{BASE_URL}/{endpoint}", headers=headers,
                         params=params, timeout=TIMEOUT)
+    if resp.status_code == 404:
+        return {"status": "OK", "data": []}   # 該当データ無し（年/区分でよくある）
     if resp.status_code == 401:
         raise ReinfolibError("APIキーが無効です（401）。キーを確認してください。")
     if resp.status_code != 200:
