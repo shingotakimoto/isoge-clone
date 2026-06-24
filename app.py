@@ -1,8 +1,4 @@
 from __future__ import annotations
-# =====================================================================
-# VALUE SCAN — 単一ファイル版（SUUMO解析→国交省照会→相場推定→Web/LINE出力）
-#   判定テキスト＋年別チャート(QuickChart)。APIキー未設定なら自動デモ。
-# =====================================================================
 import base64, hashlib, hmac, json, os, math, re, statistics, datetime, urllib.parse
 from dataclasses import dataclass, field, asdict
 from datetime import datetime as _dt
@@ -1238,6 +1234,18 @@ def _comp_year(c):
     return int(m.group()) if m else None
 
 
+def _comp_quarter(c):
+    y = _comp_year(c)
+    if not y:
+        return None
+    m = re.search(r"第([1-4])四半期", c.period or "")
+    q = int(m.group(1)) if m else 1
+    return (y, q)
+
+
+GRADE_ORDER = ["S", "A", "B", "C", "D", "E", "F"]
+
+
 def _annual_rate(comps, est_unit):
     """事例の取引年から㎡単価の年次騰落率(小数)を推定。-10%〜+15%でクランプ。"""
     pts = [(y, c.unit_price) for c in comps if (y := _comp_year(c))]
@@ -1264,6 +1272,7 @@ GRADES = [
     (9.99, "F", "スケベ価格", "#d9534f"),
 ]
 GRADE_LEGEND = "S(急げ！) > A > B > C(相場水準) > D > E > F(スケベ価格)"
+GRADE_COLORS = {g: color for _u, g, _l, color in GRADES}
 
 
 def _grade_for(ratio):
@@ -1322,6 +1331,8 @@ class Appraisal:
     method: str = ""
     representative: list = field(default_factory=list)
     yearly: list = field(default_factory=list)
+    quarterly: list = field(default_factory=list)
+    latest: dict = field(default_factory=dict)
 
 
 def appraise(area_m2, age, asking_price, comps):
@@ -1386,6 +1397,35 @@ def appraise(area_m2, age, asking_price, comps):
     yearly = [{"year": y, "market_man": round(statistics.fmean(v) * area_m2 / 1_0000),
                "count": len(v)} for y, v in sorted(ybuckets.items())]
 
+    # 四半期集計（直近20四半期＝5年）: 市場価格(万円)/流通戸数/成約戸数
+    qb = {}
+    for c in comps:
+        qk = _comp_quarter(c)
+        if not qk:
+            continue
+        d = qb.setdefault(qk, {"ups": [], "flow": 0, "deal": 0})
+        d["ups"].append(c.unit_price)
+        d["flow"] += 1
+        if c.is_deal:
+            d["deal"] += 1
+    quarterly = []
+    for (y, q) in sorted(qb)[-20:]:
+        d = qb[(y, q)]
+        quarterly.append({"label": f"{y}/Q{q}",
+                          "market_man": round(statistics.fmean(d["ups"]) * area_m2 / 1_0000),
+                          "flow": d["flow"], "deal": d["deal"]})
+
+    # 直近の成約事例（成約優先・最新の四半期）
+    def rec_key(c):
+        qk = _comp_quarter(c) or (0, 0)
+        return (1 if c.is_deal else 0, qk[0], qk[1])
+    latest = {}
+    if comps:
+        lc = max(comps, key=rec_key)
+        latest = {"period": lc.period, "floor_plan": lc.floor_plan,
+                  "trade_price": lc.trade_price, "area": lc.area,
+                  "unit_price": lc.unit_price, "is_deal": lc.is_deal}
+
     return Appraisal(
         ok=True,
         estimated_unit_price=est_unit, estimated_price=estimated_price,
@@ -1404,6 +1444,8 @@ def appraise(area_m2, age, asking_price, comps):
         n_comps=len(comps), n_deals=n_deals, method=method,
         representative=representative,
         yearly=yearly,
+        quarterly=quarterly,
+        latest=latest,
     )
 
 
@@ -1489,76 +1531,181 @@ def _appraise(prop, use_mock=False, demo=False):
         return Result(ok=False, prop=prop, city_name=city_name, appraisal=ap, message=ap.message, demo=demo)
     return Result(ok=True, prop=prop, appraisal=ap, city_name=city_name, demo=demo)
 
-"""LINE返信（VALUE SCAN）。判定テキスト＋QuickChartの年別チャート画像。"""
+"""LINE返信（VALUE SCAN）: 物件評価カード(Flex) ＋ 四半期チャート(QuickChart)。"""
 import json
 import urllib.parse
 
+TEAL = "#3aa9a0"
 
-def build_result_text(result):
+
+def _kv(label, value, vbold=False, vcolor="#222222", vsize="md"):
+    return {"type": "box", "layout": "baseline", "contents": [
+        {"type": "text", "text": label, "color": "#888888", "size": "sm", "flex": 4},
+        {"type": "text", "text": value, "color": vcolor, "size": vsize, "flex": 6,
+         "align": "end", "weight": "bold" if vbold else "regular", "wrap": True}]}
+
+
+def _grade_bar(current):
+    cells = [{"type": "box", "layout": "vertical", "flex": 1,
+              "backgroundColor": GRADE_COLORS.get(g, "#ccc"), "cornerRadius": "3px",
+              "paddingTop": "3px", "paddingBottom": "3px",
+              "borderWidth": ("2px" if g == current else "0px"), "borderColor": "#333333",
+              "contents": [{"type": "text", "text": g, "color": "#ffffff",
+                            "weight": "bold", "size": "sm", "align": "center"}]}
+             for g in GRADE_ORDER]
+    ptr = [{"type": "text", "text": ("▲" if g == current else " "), "flex": 1,
+            "color": GRADE_COLORS.get(current, "#333"), "size": "sm", "align": "center"}
+           for g in GRADE_ORDER]
+    return {"type": "box", "layout": "vertical", "spacing": "xs", "margin": "md", "contents": [
+        {"type": "box", "layout": "horizontal", "spacing": "xs", "contents": cells},
+        {"type": "box", "layout": "horizontal", "spacing": "xs", "contents": ptr},
+        {"type": "box", "layout": "horizontal", "contents": [
+            {"type": "text", "text": "割安", "color": "#16a085", "size": "xs"},
+            {"type": "text", "text": "割高", "color": "#d9534f", "size": "xs", "align": "end"}]}]}
+
+
+def build_result_flex(result):
     ap = result.appraisal
     p = result.prop
-    name = p.name if p else "物件"
-    area = f"{p.area_m2:.2f}㎡" if (p and p.area_m2) else "—"
-    return "\n".join([
-        "【物件情報】",
-        f"・物件名: {name}",
-        f"・物件価格: {yen_man(ap.asking_price)}",
-        f"・物件坪単価: {tsubo_man(ap.asking_unit_price)}",
-        f"・専有面積: {area}",
-        f"・年次価格騰落率: {ap.annual_rate * 100:+.1f}%",
-        "",
-        "【現時点】",
-        f"・割安度: {ap.grade}",
-        f"・相場物件価格: {yen_man(ap.estimated_price)}",
-        f"・相場坪単価: {tsubo_man(ap.estimated_unit_price)}",
-        f"・期待利益: {profit_str(ap.expected_profit)}",
-        "",
-        "【将来予測(1年後)】",
-        f"・割安度: {ap.future_grade}",
-        f"・相場物件価格: {yen_man(ap.future_price)}",
-        f"・相場坪単価: {tsubo_man(ap.future_unit_price)}",
-        f"・期待利益: {profit_str(ap.future_profit)}",
-        "",
-        f"※割安度: {GRADE_LEGEND}",
-    ])
+    name = (p.name if p else "物件")[:30]
+    spec = " / ".join([x for x in [
+        (p.floor_plan if p else ""),
+        (f"{p.area_m2:.2f}㎡" if (p and p.area_m2) else ""),
+        (f"{p.floor}階" if (p and p.floor) else "")] if x]) or "—"
+
+    profit = ap.expected_profit or 0
+    verdict = f"相場より {yen_man(abs(profit))} {'割安' if profit >= 0 else '割高'}"
+    vcolor = "#16a085" if profit >= 0 else "#d9534f"
+
+    eval_row = {"type": "box", "layout": "horizontal", "spacing": "md", "contents": [
+        {"type": "box", "layout": "vertical", "flex": 7, "contents": [
+            {"type": "text", "text": verdict, "color": vcolor, "weight": "bold",
+             "size": "lg", "wrap": True},
+            {"type": "text", "text": f"相場価格 {yen_man(ap.estimated_price)}",
+             "size": "sm", "color": "#555555", "margin": "sm"},
+            {"type": "text", "text": f"相場坪単価 {tsubo_man(ap.estimated_unit_price)}",
+             "size": "sm", "color": "#555555"}]},
+        {"type": "box", "layout": "vertical", "flex": 0, "width": "64px", "height": "64px",
+         "backgroundColor": GRADE_COLORS.get(ap.grade, "#888"), "cornerRadius": "8px",
+         "justifyContent": "center", "contents": [
+             {"type": "text", "text": ap.grade or "?", "color": "#ffffff",
+              "weight": "bold", "size": "3xl", "align": "center"}]}]}
+
+    body = [
+        {"type": "text", "text": spec, "size": "sm", "color": "#444444", "wrap": True},
+        {"type": "separator", "margin": "md"},
+        _kv("物件価格", yen_man(ap.asking_price), vbold=True, vsize="lg"),
+        _kv("坪単価", tsubo_man(ap.asking_unit_price)),
+        {"type": "separator", "margin": "md"},
+        {"type": "text", "text": "物件評価", "weight": "bold", "size": "md", "margin": "md"},
+        eval_row,
+        _grade_bar(ap.grade),
+        {"type": "separator", "margin": "lg"},
+        {"type": "text", "text": "直近の成約事例", "weight": "bold", "size": "md", "margin": "md"},
+    ]
+    lt = ap.latest or {}
+    if lt:
+        tag = "成約" if lt.get("is_deal") else "取引"
+        area = f"{lt['area']:.2f}㎡" if lt.get("area") else "—"
+        body += [
+            {"type": "box", "layout": "horizontal", "contents": [
+                {"type": "text", "text": f"{lt.get('period', '')} {tag}", "size": "sm", "color": "#555555"},
+                {"type": "text", "text": lt.get("floor_plan", ""), "size": "sm", "color": "#555555", "align": "end"}]},
+            {"type": "box", "layout": "horizontal", "contents": [
+                {"type": "text", "text": yen_man(lt.get("trade_price")), "size": "lg",
+                 "weight": "bold", "color": "#1a8a7a"},
+                {"type": "text", "text": area, "size": "sm", "color": "#555555",
+                 "align": "end", "gravity": "bottom"}]},
+            {"type": "text", "text": f"坪単価：{tsubo_man(lt.get('unit_price'))}",
+             "size": "sm", "color": "#555555"}]
+    else:
+        body.append({"type": "text", "text": "（周辺の事例が不足しています）",
+                     "size": "sm", "color": "#999999"})
+    body += [
+        {"type": "separator", "margin": "lg"},
+        {"type": "text", "text": "データ出典元：国土交通省 不動産情報ライブラリ",
+         "size": "xxs", "color": "#aaaaaa", "margin": "md", "wrap": True},
+        {"type": "text", "text": f"※割安度 {GRADE_LEGEND}",
+         "size": "xxs", "color": "#aaaaaa", "wrap": True},
+    ]
+
+    bubble = {"type": "bubble", "size": "mega",
+              "header": {"type": "box", "layout": "vertical", "backgroundColor": TEAL,
+                         "paddingAll": "16px", "contents": [
+                             {"type": "text", "text": name, "color": "#ffffff",
+                              "weight": "bold", "size": "xl", "wrap": True}]},
+              "body": {"type": "box", "layout": "vertical", "paddingAll": "16px",
+                       "spacing": "sm", "contents": body}}
+    return {"type": "flex",
+            "altText": f"{name} の割安度判定：{ap.grade}（相場{yen_man(ap.estimated_price)}）",
+            "contents": bubble}
+
+
+def _chart_cfg(ap, quarters, lite=False):
+    q = ap.quarterly[-quarters:]
+    labels = [d["label"] for d in q]
+    market = [d["market_man"] for d in q]
+    flow = [d["flow"] for d in q]
+    deal = [d["deal"] for d in q]
+    asking = round((ap.asking_price or 0) / 1_0000)
+    ds = [
+        {"type": "line", "label": ("当該価格" if lite else "当該物件価格"),
+         "data": [asking] * len(labels), "borderColor": "rgb(20,40,120)",
+         "borderDash": [6, 4], "fill": False, "pointRadius": 0, "yAxisID": "R"},
+        {"type": "line", "label": ("成約相場" if lite else "成約相場(所在階)"),
+         "data": market, "borderColor": "rgb(30,90,230)", "fill": False, "yAxisID": "R"},
+        {"type": "bar", "label": ("流通" if lite else "流通戸数"), "data": flow,
+         "backgroundColor": "rgba(40,200,170,0.8)", "yAxisID": "L"},
+    ]
+    if not lite:
+        ds.append({"type": "bar", "label": "成約戸数", "data": deal,
+                   "backgroundColor": "rgba(20,90,50,0.85)", "yAxisID": "L"})
+    title = "価格推移(四半期)" if lite else "物件価格 過去推移 (四半期)"
+    return {"type": "bar", "data": {"labels": labels, "datasets": ds},
+            "options": {"title": {"display": True, "text": title},
+                        "scales": {"yAxes": [
+                            {"id": "L", "position": "left",
+                             "scaleLabel": {"display": True, "labelString": "戸数"}},
+                            {"id": "R", "position": "right",
+                             "gridLines": {"drawOnChartArea": False},
+                             "scaleLabel": {"display": True, "labelString": "万円"}}]}}}
+
+
+def chart_url(ap):
+    """QuickChartで四半期チャート。まず短縮URL(POST)、失敗時はGET簡易版。"""
+    ql = getattr(ap, "quarterly", None)
+    if not ql or len(ql) < 2:
+        return None
+    # 1) POST 短縮URL（全データセット・きれいなラベル）
+    try:
+        r = requests.post("https://quickchart.io/chart/create",
+                          json={"chart": _chart_cfg(ap, 16, lite=False),
+                                "width": 700, "height": 400, "backgroundColor": "white"},
+                          timeout=6)
+        if r.ok:
+            j = r.json()
+            if j.get("success") and j.get("url"):
+                return j["url"]
+    except Exception:
+        pass
+    # 2) GETフォールバック（簡易版・URL長に収まる範囲で）
+    for keep in (10, 8, 6, 4):
+        c = json.dumps(_chart_cfg(ap, keep, lite=True), ensure_ascii=False, separators=(",", ":"))
+        url = "https://quickchart.io/chart?w=700&h=400&bkg=white&c=" + urllib.parse.quote(c)
+        if len(url) <= 1900:
+            return url
+    return None
 
 
 def year_chart_url(ap):
-    """年別の市場価格(線)＋当該物件価格(赤線)＋流通戸数(棒) を QuickChart で。"""
-    yl = getattr(ap, "yearly", None)
-    if not yl or len(yl) < 2:
-        return None
-    yl = yl[-10:]
-    labels = [str(d["year"]) for d in yl]
-    market = [d["market_man"] for d in yl]
-    counts = [d["count"] for d in yl]
-    asking = round((ap.asking_price or 0) / 1_0000)
-    cfg = {"type": "bar", "data": {"labels": labels, "datasets": [
-        {"type": "line", "label": "当該物件価格", "data": [asking] * len(labels),
-         "borderColor": "rgb(230,30,30)", "backgroundColor": "rgb(230,30,30)",
-         "fill": False, "pointRadius": 0, "yAxisID": "L"},
-        {"type": "line", "label": "市場物件価格(所在階)", "data": market,
-         "borderColor": "rgb(30,60,230)", "backgroundColor": "rgb(30,60,230)",
-         "fill": False, "yAxisID": "L"},
-        {"type": "bar", "label": "流通戸数", "data": counts,
-         "backgroundColor": "rgba(80,130,230,0.55)", "yAxisID": "R"}]},
-        "options": {"title": {"display": True, "text": "年別 市場価格と流通戸数"},
-                    "scales": {"yAxes": [
-                        {"id": "L", "position": "left",
-                         "scaleLabel": {"display": True, "labelString": "万円"}},
-                        {"id": "R", "position": "right",
-                         "gridLines": {"drawOnChartArea": False},
-                         "scaleLabel": {"display": True, "labelString": "戸"}}]}}}
-    c = json.dumps(cfg, ensure_ascii=False, separators=(",", ":"))
-    url = "https://quickchart.io/chart?w=640&h=400&bkg=white&c=" + urllib.parse.quote(c)
-    return url if len(url) <= 1900 else None
+    return chart_url(ap)
 
 
 def build_messages(result):
     if not result.ok:
         return [{"type": "text", "text": "⚠️ " + (result.message or "判定できませんでした。")}]
-    msgs = [{"type": "text", "text": build_result_text(result)}]
-    url = year_chart_url(result.appraisal)
+    msgs = [build_result_flex(result)]
+    url = chart_url(result.appraisal)
     if url:
         msgs.append({"type": "image", "originalContentUrl": url, "previewImageUrl": url})
     return msgs
