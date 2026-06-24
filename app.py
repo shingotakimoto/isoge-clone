@@ -1596,17 +1596,13 @@ class Result:
     demo: bool = False
 
 def appraise_from_url(url, use_mock=False):
-    prop = None
+    # デモでも解析失敗時はサンプルに逃げず「未対応」を正直に返す
     try:
         prop = fetch_property(url)
     except PropertyParseError as e:
-        if not use_mock:
-            return Result(ok=False, message=str(e))
+        return Result(ok=False, message=str(e))
     except Exception as e:
-        if not use_mock:
-            return Result(ok=False, message=f"ページ取得エラー: {e}")
-    if prop is None:
-        return _appraise(SAMPLE_PROPERTY, use_mock=True, demo=True)
+        return Result(ok=False, message=f"ページ取得エラー: {e}")
     return _appraise(prop, use_mock=use_mock)
 
 def appraise_manual(prop, use_mock=False):
