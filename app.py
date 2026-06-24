@@ -1403,6 +1403,27 @@ def _similar(comps, age, area):
     return narrowed if len(narrowed) >= MIN_COMPS else comps
 
 
+def _select(comps, district, age, area):
+    """建物寄せの段階フィルタ：同地区→近い築年・面積→エリア全体 の順で十分件数の最も狭い層を返す。"""
+    def area_ok(c, r):
+        return (not area) or (not c.area) or ((1 - r) * area <= c.area <= (1 + r) * area)
+    def age_ok(c, d):
+        return age is None or c.age is None or abs(c.age - age) <= d
+    def dist_ok(c):
+        return bool(district) and bool(c.district) and (district in c.district or c.district in district)
+    tiers = [
+        ("同地区・同築年帯で厳選", lambda c: dist_ok(c) and age_ok(c, 3) and area_ok(c, 0.3)),
+        ("同地区で抽出", lambda c: dist_ok(c) and age_ok(c, 8) and area_ok(c, 0.6)),
+        ("近い築年・面積で抽出", lambda c: age_ok(c, 10) and area_ok(c, 0.5)),
+        ("エリア全体で推定", lambda c: True),
+    ]
+    for label, f in tiers:
+        sel = [c for c in comps if f(c)]
+        if len(sel) >= MIN_COMPS:
+            return sel, label
+    return comps, "エリア全体で推定"
+
+
 @dataclass
 class Appraisal:
     ok: bool
@@ -1437,7 +1458,7 @@ class Appraisal:
     latest: dict = field(default_factory=dict)
 
 
-def appraise(area_m2, age, asking_price, comps):
+def appraise(area_m2, age, asking_price, comps, district=None):
     if not area_m2 or not asking_price:
         return Appraisal(ok=False, message="専有面積または売出価格が不明です。")
 
@@ -1449,7 +1470,7 @@ def appraise(area_m2, age, asking_price, comps):
                          message=("周辺の取引事例が不足しているため判定できませんでした"
                                   f"（有効事例 {len(comps)} 件）。"))
 
-    used = _similar(comps, age, area_m2)
+    used, tier = _select(comps, district, age, area_m2)
     unit_prices = [c.unit_price for c in used]
     mean_up = statistics.fmean(unit_prices)
     cv = (statistics.pstdev(unit_prices) / mean_up) if mean_up else 1.0
@@ -1465,13 +1486,13 @@ def appraise(area_m2, age, asking_price, comps):
             lo = _quantile([u for _, u in aged], 0.05)
             hi = _quantile([u for _, u in aged], 0.95)
             if b1 <= 0 and lo <= pred <= hi:
-                est_unit, method = pred, f"築年回帰（{len(aged)}件）"
+                est_unit, method = pred, f"{tier}・築年回帰（{len(aged)}件）"
     if est_unit is None:
         med_up = statistics.median(unit_prices)
         ages = [c.age for c in used if c.age is not None]
         base_age = statistics.median(ages) if ages else 25
         est_unit = med_up * (depreciation_factor(age) / depreciation_factor(int(base_age)))
-        method = f"類似中央値×築年補正（{len(used)}件）"
+        method = f"{tier}・中央値補正（{len(used)}件）"
 
     estimated_price = int(est_unit * area_m2)
     ratio = asking_price / estimated_price
@@ -1586,6 +1607,17 @@ SAMPLE_PROPERTY = Property(
     station="東京メトロ有楽町線 豊洲駅 徒歩8分", walk_min=8, structure="ＲＣ",
     url="https://suumo.jp/ms/chuko/")
 
+def _district_of(address):
+    """住所から地区名（丁目・番地を除いた町名）を抽出。例 東京都文京区小石川3丁目 → 小石川"""
+    try:
+        _, rest = split_prefecture(address or "")
+    except Exception:
+        rest = address or ""
+    rest = re.sub(r"^.+?[区市町村]", "", rest or "", count=1)
+    d = re.split(r"[0-9０-９]", rest)[0] if rest else ""
+    return d.replace("丁目", "").strip("　 ") or None
+
+
 @dataclass
 class Result:
     ok: bool
@@ -1624,7 +1656,8 @@ def _appraise(prop, use_mock=False, demo=False):
         comps = fetch_comps(city_code or "00000", use_mock=use_mock)
     except ReinfolibError as e:
         return Result(ok=False, prop=prop, city_name=city_name, message=str(e))
-    ap = appraise(prop.area_m2, prop.age, prop.price_yen, comps)
+    ap = appraise(prop.area_m2, prop.age, prop.price_yen, comps,
+                            district=_district_of(prop.address))
     if not ap.ok:
         return Result(ok=False, prop=prop, city_name=city_name, appraisal=ap, message=ap.message, demo=demo)
     return Result(ok=True, prop=prop, appraisal=ap, city_name=city_name, demo=demo)
@@ -1892,7 +1925,7 @@ INDEX_HTML = r'''<!DOCTYPE html>
     <div class="logo">🏢 VALUE SCAN</div>
     <h1>マンション割安判定サービス</h1>
     <div class="en">VALUE SCAN</div>
-    <p>気になる中古マンションの <b>SUUMOリンクを貼るだけ</b>。<br>
+    <p>気になる中古マンションの <b>物件ページのURLを貼るだけ</b>。<br>
        周辺の取引・成約事例から、割安／割高をすぐに判定します。</p>
     <div class="badges">
       <span class="badge">登録不要</span>
