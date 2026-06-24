@@ -1254,16 +1254,16 @@ def parse_property(html: str, url: str = "") -> Property:
     price = (ld.get("price")
              or _to_price(_find(pairs, "価格", "販売価格", "物件価格"))
              or _scan_price(full))
-    area_label = _find(pairs, "専有面積", "面積")
+    area_label = _find(pairs, "専有面積") or _find(pairs, "面積")
     area = ld.get("area") or _to_area(area_label)
     if area is None and area_label:
         mnum = re.search(r"(\d+(?:\.\d+)?)", area_label)
         if mnum and 10 <= float(mnum.group(1)) <= 400:
             area = float(mnum.group(1))
     area = area or _scan_area(full)
-    address = (_find(pairs, "所在地", "住所", "所在")
-               or ld.get("address")
-               or _scan_address(full) or "")
+    address = _find(pairs, "所在地") or _find(pairs, "住所") or ld.get("address") or ""
+    if not _ADDR_RE.search(address or ""):   # 都道府県＋市区が無ければ住所ではない→全文から
+        address = _scan_address(full) or address
     by, bm = _to_built(_find(pairs, "築年月", "完成時期", "竣工", "建築年月", "築年"))
     if not by:
         by, bm = _scan_built(full)
