@@ -957,7 +957,7 @@ import requests
 from bs4 import BeautifulSoup
 
 USER_AGENT = (
-    "Mozilla/5.0 (compatible; ISOGE-clone/1.0; +contact@example.com) "
+    "Mozilla/5.0 (compatible; value-scan/1.0; +contact@example.com) "
     "appraisal-prototype"
 )
 TIMEOUT = 20
@@ -1504,7 +1504,7 @@ def build_result_flex(result: Result) -> dict:
         "type": "box", "layout": "vertical", "backgroundColor": ap.grade_color,
         "paddingAll": "16px", "spacing": "xs",
         "contents": [
-            {"type": "text", "text": "ISOGE! 割安度判定", "color": "#ffffffcc", "size": "xs"},
+            {"type": "text", "text": "VALUE SCAN 割安度判定", "color": "#ffffffcc", "size": "xs"},
             {"type": "text", "text": name, "color": "#ffffff", "size": "md",
              "weight": "bold", "wrap": True},
             {"type": "box", "layout": "baseline", "spacing": "md", "margin": "md",
@@ -1608,7 +1608,7 @@ def build_messages(result: Result) -> list[dict]:
 
 
 WELCOME_TEXT = (
-    "ISOGE!クローンへようこそ🏢\n\n"
+    "VALUE SCANへようこそ🏢\n\n"
     "気になる中古マンションの【SUUMOのURL】をそのまま送ってください。\n"
     "周辺の取引・成約事例から、割安/割高度を判定します。\n\n"
     "※判定は推定値です。データ出典: 国土交通省 不動産情報ライブラリ"
@@ -1619,7 +1619,7 @@ INDEX_HTML = r'''<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>マンション割安判定サービス ISOGE!（クローン）</title>
+<title>VALUE SCAN｜マンション割安判定サービス</title>
 <style>
   :root{
     --blue:#2b8cd9; --blue-d:#1f6fb2; --green:#06c755; --green-d:#05a648;
@@ -1700,9 +1700,9 @@ INDEX_HTML = r'''<!DOCTYPE html>
 </head>
 <body>
   <header class="hero">
-    <div class="logo">🏢 ISOGE! CLONE</div>
+    <div class="logo">🏢 VALUE SCAN</div>
     <h1>マンション割安判定サービス</h1>
-    <div class="en">ISOGE!</div>
+    <div class="en">VALUE SCAN</div>
     <p>気になる中古マンションの <b>SUUMOリンクを貼るだけ</b>。<br>
        周辺の取引・成約事例から、割安／割高をすぐに判定します。</p>
     <div class="badges">
@@ -1733,7 +1733,7 @@ INDEX_HTML = r'''<!DOCTYPE html>
     <section id="result"></section>
   </main>
 
-  <footer class="site">© ISOGE! クローン（学習用プロトタイプ）｜データ出典：国土交通省 不動産情報ライブラリ</footer>
+  <footer class="site">© VALUE SCAN（学習用プロトタイプ）｜データ出典：国土交通省 不動産情報ライブラリ</footer>
 
 <script>
 const form = document.getElementById('form');
