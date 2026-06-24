@@ -1269,41 +1269,44 @@ def fetch_property(url: str) -> Property:
 # --------------------------------------------------------------------------- #
 
 def parse_listing(html: str, base_url: str = "") -> list:
-    """検索結果ページから物件サマリ（名前/価格/面積/所在地/築年/URL）を複数抽出。"""
+    """検索結果ページから物件サマリを複数抽出（リンク近傍ブロック方式・クラス名非依存）。"""
     soup = BeautifulSoup(html, "html.parser")
-    items = []
-    blocks = soup.select("div.property_unit-content") or soup.select("div.property_unit")
-    for b in blocks:
-        a = b.select_one(".property_unit-title a") or b.find("a", href=True)
-        name = a.get_text(strip=True) if a else "物件"
-        href = a.get("href") if a else ""
+    items, seen = [], set()
+
+    # 1) 物件ブロック（dottableを含むカセット）
+    for b in soup.select("div.property_unit-content, div.property_unit, div.cassetteitem, .dottable--cassette"):
+        a = b.find("a", href=True)
+        if not a:
+            continue
         txt = b.get_text(" ", strip=True)
         pairs = _label_map(b)
         price = _to_price(_find(pairs, "価格", "販売価格")) or _scan_price(txt)
         area = _to_area(_find(pairs, "専有面積", "面積")) or _scan_area(txt)
-        addr = _find(pairs, "所在地", "住所") or _scan_address(txt) or ""
-        by, _bm = _to_built(_find(pairs, "築年月", "築年数", "築年"))
-        if not by:
+        url = urljoin(base_url, a["href"])
+        if price and area and url not in seen:
+            seen.add(url)
             by, _bm = _scan_built(txt)
-        if price and area:
-            items.append({"name": name[:40], "url": urljoin(base_url, href) if href else "",
-                          "price_yen": price, "area_m2": area, "address": addr, "built_year": by})
+            items.append({"name": (a.get_text(strip=True) or "物件")[:40], "url": url,
+                          "price_yen": price, "area_m2": area,
+                          "address": _scan_address(txt) or "", "built_year": by})
     if items:
         return items
-    # 汎用フォールバック：詳細リンクの近傍ブロックから抽出
-    seen = set()
+
+    # 2) 物件詳細リンク（nc_数字 等）の近傍ブロックから抽出
     for a in soup.find_all("a", href=True):
+        if not re.search(r"(nc_\d+|bc_\d+|/b-\d+|/bukken/\d|nj_\d+)", a["href"]):
+            continue
         cur = a
-        for _ in range(5):
+        for _ in range(6):
             cur = cur.parent
             if cur is None:
                 break
             txt = cur.get_text(" ", strip=True)
-            if "万円" in txt and re.search(r"\d+(?:\.\d+)?\s*(?:㎡|m²|m\s*2|平米)", txt) and len(txt) < 600:
+            if "万円" in txt and re.search(r"\d+(?:\.\d+)?\s*(?:㎡|m²|m\s*2|平米)", txt):
                 price = _scan_price(txt)
                 area = _scan_area(txt)
                 url = urljoin(base_url, a["href"])
-                if price and area and url not in seen:
+                if price and area and url not in seen and len(txt) < 800:
                     seen.add(url)
                     by, _bm = _scan_built(txt)
                     items.append({"name": (a.get_text(strip=True) or "物件")[:40], "url": url,
@@ -1761,6 +1764,25 @@ def screen_listing(url, use_mock=False, limit=30):
     return {"ok": True, "scanned": len(items), "judged": len(results),
             "s_count": sum(1 for r in results if r["grade"] == "S"), "results": results}
 
+
+def batch_judge(urls, use_mock=False, limit=30):
+    """複数の物件URLを判定→割安順（Sが上）に集計。詳細ページ方式で確実。"""
+    results = []
+    for u in urls[:limit]:
+        r = appraise_from_url(u, use_mock=use_mock)
+        if not r.ok:
+            continue
+        ap, p = r.appraisal, r.prop
+        results.append({"name": p.name, "url": p.url, "grade": ap.grade,
+                        "grade_label": ap.grade_label, "grade_color": ap.grade_color,
+                        "price_man": yen_man(ap.asking_price),
+                        "market_man": yen_man(ap.estimated_price),
+                        "discount_pct": round(ap.discount_pct, 1), "ratio": ap.ratio,
+                        "area": p.area_m2, "built_year": p.built_year})
+    results.sort(key=lambda r: r["ratio"])
+    return {"ok": True, "judged": len(results),
+            "s_count": sum(1 for r in results if r["grade"] == "S"), "results": results}
+
 """LINE返信（VALUE SCAN）: クリーンな割安判定カード(Flex) ＋ 四半期チャート。"""
 import json
 import urllib.parse
@@ -2054,15 +2076,20 @@ INDEX_HTML = r'''<!DOCTYPE html>
     <section id="result"></section>
 
     <section class="card" style="margin-top:18px">
-      <h2>一覧ページから一括判定（Sランク抽出）</h2>
-      <p class="sub">SUUMO等の検索結果ページのURLを貼ると、掲載物件をまとめて判定し、割安順（S→）に並べます。</p>
+      <h2>まとめて判定（Sランク抽出）</h2>
+      <p class="sub"><b>方法1（確実・推奨）</b>：気になる物件の詳細URLを改行で複数貼り付け</p>
+      <form id="bform">
+        <textarea id="burls" rows="4" placeholder="https://suumo.jp/ms/chuko/.../nc_xxxxxxxx/  （改行で複数）" style="width:100%;box-sizing:border-box;padding:12px;border:1.5px solid var(--line);border-radius:10px;font-size:13px;outline:none"></textarea>
+        <button class="btn-go" type="submit" style="margin-top:8px">URLをまとめて判定</button>
+      </form>
+      <p class="sub" style="margin-top:16px"><b>方法2（試験的）</b>：SUUMO検索結果ページのURL（サイトにより取得できないことがあります）</p>
       <form id="sform" class="field">
         <input id="surl" type="url" placeholder="検索結果ページのURL（SUUMO）" autocomplete="off">
-        <button class="btn-go" type="submit">一括判定</button>
+        <button class="btn-go" type="submit">一覧から判定</button>
       </form>
-      <label style="font-size:12px;color:var(--muted);display:inline-block;margin-top:8px"><input type="checkbox" id="sonly"> Sランクのみ表示</label>
+      <label style="font-size:12px;color:var(--muted);display:inline-block;margin-top:10px"><input type="checkbox" id="sonly"> Sランクのみ表示</label>
       <div id="sresult"></div>
-      <p class="note">※掲載物件を順に判定します（件数により時間がかかります）。ページ取得は各サイトの規約をご確認ください。実判定には国交省キーが必要です。</p>
+      <p class="note">※物件を順に判定します（最大30件・件数により時間がかかります）。ページ取得は各サイトの規約をご確認ください。実判定には国交省キーが必要です。</p>
     </section>
 
     <section class="card" style="margin-top:18px">
@@ -2197,6 +2224,19 @@ if(sform){
     }catch(err){ sresult.innerHTML='<div class="err">通信エラーが発生しました。</div>'; }
   });
   sonly.addEventListener('change', srender);
+}
+
+const bform=document.getElementById('bform');
+if(bform){
+  bform.addEventListener('submit', async e=>{
+    e.preventDefault();
+    const urls=document.getElementById('burls').value.trim(); if(!urls) return;
+    sresult.innerHTML='<div class="loading"><div class="spinner"></div>URLをまとめて判定しています…</div>';
+    try{
+      const r=await fetch('/api/batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({urls})});
+      _sdata=await r.json(); srender();
+    }catch(err){ sresult.innerHTML='<div class="err">通信エラーが発生しました。</div>'; }
+  });
 }
 </script>
 </body>
@@ -2376,6 +2416,19 @@ def api_screen():
     if not url:
         return jsonify({"ok": False, "message": "一覧ページのURLを入力してください。"}), 400
     return jsonify(screen_listing(url, use_mock=DEMO_MODE))
+
+
+@app.post("/api/batch")
+def api_batch():
+    payload = request.get_json(silent=True) or {}
+    urls = []
+    for tok in re.split(r"\s+", payload.get("urls", "") or ""):
+        u = is_suumo_url(tok)
+        if u:
+            urls.append(u)
+    if not urls:
+        return jsonify({"ok": False, "message": "物件URLを1件以上（改行区切りで）入力してください。"}), 400
+    return jsonify(batch_judge(urls, use_mock=DEMO_MODE))
 
 
 @app.get("/healthz")
