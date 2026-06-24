@@ -925,39 +925,47 @@ def _load_mock_comps() -> list[Comp]:
     return out
 
 """
-SUUMO 中古マンション 詳細ページの解析。
+不動産物件ページの汎用パーサ（VALUE SCAN）。
 
-SUUMOの物件詳細ページ（例: https://suumo.jp/ms/chuko/.../nc_XXXXXXXXX/）は
-`dt`/`dd` の表（dottable）構造でサーバーレンダリングされており、
-ラベル名（価格 / 所在地 / 専有面積 / 間取り / 築年月 / 沿線・駅 …）を手がかりに
-ラベルベースで値を取り出す。クラス名に依存しないので markup 変更に比較的強い。
+許可せず限定もしない：公開URLを送れば解析を試み、価格/面積/所在地/築年/間取り/階 を抽出。
+抽出の優先順位:
+  1) JSON-LD (application/ld+json) の name/price/floorSize/address
+  2) dt/dd・th/td のラベル→値（SUUMO等の表）
+  3) ページ全文への正規表現スキャン（フォールバック：各社サイト）
 
-【重要・規約に関する注意】
-SUUMOの自動アクセス／スクレイピングは同サイトの利用規約に抵触する可能性がある。
-本番運用ではSUUMO（リクルート）との許諾、もしくは公式提供データの利用を検討すること。
-本モジュールは:
-  - 低頻度アクセス前提（CACHEや手動入力フォールバックと併用）
-  - 礼儀的なUser-Agentを送出
-  - 取得失敗時は PropertyParseError を投げ、呼び出し側で手入力に切り替えられる
-ように作ってある。解析セレクタは差し替え可能。
+【注意】各サイトの自動取得は各社の利用規約に抵触する可能性があります。本番運用では
+各社の許諾・公式データ提供をご確認ください。JavaScript描画ページは取得できません。
 """
 
 
+import json
 import re
 from dataclasses import dataclass, asdict
 
 from typing import Optional
+from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup
 
-USER_AGENT = (
-    "Mozilla/5.0 (compatible; value-scan/1.0; +contact@example.com) "
-    "appraisal-prototype"
-)
+USER_AGENT = ("Mozilla/5.0 (compatible; value-scan/1.0; appraisal-prototype)")
 TIMEOUT = 20
 
-SUUMO_HOST_RE = re.compile(r"(^|\.)suumo\.jp$", re.I)
+# 既知の不動産サイト（メッセージ表示用。判定はこれに限定しない）
+KNOWN_SITES = ["suumo.jp", "homes.co.jp", "athome.co.jp", "realestate.yahoo.co.jp",
+               "myhome.nifty.com", "rehouse.co.jp", "livable.co.jp", "stepon.co.jp",
+               "nomu.com", "daikyo-anabuki.co.jp"]
+
+_BLOCKED_HOST = re.compile(
+    r"^(localhost|0\.0\.0\.0)$|^127\.|^10\.|^192\.168\.|^172\.(1[6-9]|2\d|3[01])\.|"
+    r"^169\.254\.|\.local$|^\[?::1\]?$")
+
+PREFECTURES = ("北海道青森県岩手県宮城県秋田県山形県福島県茨城県栃木県群馬県埼玉県千葉県"
+               "東京都神奈川県新潟県富山県石川県福井県山梨県長野県岐阜県静岡県愛知県三重県"
+               "滋賀県京都府大阪府兵庫県奈良県和歌山県鳥取県島根県岡山県広島県山口県徳島県"
+               "香川県愛媛県高知県福岡県佐賀県長崎県熊本県大分県宮崎県鹿児島県沖縄県")
+_PREF_LIST = re.findall(r"..[都道府県]", PREFECTURES)
+_ADDR_RE = re.compile("(" + "|".join(map(re.escape, _PREF_LIST)) + r")[^\s、，,。]{0,18}?[市区郡]")
 
 
 class PropertyParseError(RuntimeError):
@@ -966,17 +974,17 @@ class PropertyParseError(RuntimeError):
 
 @dataclass
 class Property:
-    name: str                      # 物件名
-    price_yen: Optional[int]       # 売出価格（円）
-    address: str                   # 所在地
-    area_m2: Optional[float]       # 専有面積（㎡）
-    floor_plan: str                # 間取り
-    built_year: Optional[int]      # 築年（西暦）
+    name: str
+    price_yen: Optional[int]
+    address: str
+    area_m2: Optional[float]
+    floor_plan: str
+    built_year: Optional[int]
     built_month: Optional[int]
-    floor: Optional[int]           # 所在階
-    station: str                   # 沿線・駅
-    walk_min: Optional[int]        # 駅徒歩（分）
-    structure: str                 # 構造・階建
+    floor: Optional[int]
+    station: str
+    walk_min: Optional[int]
+    structure: str
     url: str
 
     @property
@@ -992,43 +1000,148 @@ class Property:
 
 
 # --------------------------------------------------------------------------- #
-# URL バリデーション
+# URL 抽出（公開URLのみ・内部/プライベートは拒否）
 # --------------------------------------------------------------------------- #
 
 def is_suumo_url(text: str) -> Optional[str]:
-    """テキストからSUUMOのURLを1つ抽出して返す（無ければNone）。"""
+    """テキストから最初の公開http(s) URLを返す（内部宛はNone）。互換のため名称据え置き。"""
     m = re.search(r"https?://[^\s]+", text or "")
     if not m:
         return None
     url = m.group().rstrip("　 、。)）」』>")
-    from urllib.parse import urlparse
-    host = urlparse(url).netloc.split(":")[0]
-    if SUUMO_HOST_RE.search(host):
-        return url
-    return None
+    host = (urlparse(url).hostname or "").lower()
+    if not host or _BLOCKED_HOST.search(host):
+        return None
+    return url
 
-
-# --------------------------------------------------------------------------- #
-# 取得
-# --------------------------------------------------------------------------- #
 
 def fetch_html(url: str) -> str:
     resp = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT)
     if resp.status_code != 200:
-        raise PropertyParseError(f"SUUMOページ取得に失敗しました（{resp.status_code}）")
-    resp.encoding = resp.apparent_encoding or "utf-8"
+        raise PropertyParseError(f"ページ取得に失敗しました（HTTP {resp.status_code}）")
+    resp.encoding = resp.apparent_encoding or resp.encoding or "utf-8"
     return resp.text
 
 
 # --------------------------------------------------------------------------- #
-# パース補助
+# 値パーサ
 # --------------------------------------------------------------------------- #
 
-def _build_label_map(soup: BeautifulSoup) -> dict[str, str]:
-    """dt/dd・th/td のラベル→値マップを作る。"""
-    pairs: dict[str, str] = {}
+def _to_price(s: Optional[str]) -> Optional[int]:
+    if not s:
+        return None
+    s = s.replace(",", "").replace(" ", "").replace("　", "")
+    total = 0
+    mo = re.search(r"(\d+(?:\.\d+)?)億", s)
+    if mo:
+        total += int(float(mo.group(1)) * 1_0000_0000)
+    mm = re.search(r"(\d+(?:\.\d+)?)万", s)
+    if mm:
+        total += int(float(mm.group(1)) * 1_0000)
+    return total or None
 
-    # dt/dd ペア
+
+def _to_area(s: Optional[str]) -> Optional[float]:
+    if not s:
+        return None
+    m = re.search(r"(\d+(?:\.\d+)?)\s*(?:㎡|m²|m\s*2|m2|平米|平方メートル)", s, re.I)
+    return float(m.group(1)) if m else None
+
+
+def _to_built(s: Optional[str]):
+    if not s:
+        return None, None
+    year = month = None
+    m = re.search(r"(19|20)\d{2}", s)
+    if m:
+        year = int(m.group())
+    else:
+        year = _to_west_year(s)
+    mm = re.search(r"年\s*(\d{1,2})\s*月", s)
+    if mm:
+        month = int(mm.group(1))
+    if year is None:
+        ma = re.search(r"築\s*(\d{1,3})\s*年", s)
+        if ma:
+            year = _dt.now().year - int(ma.group(1))
+    return year, month
+
+
+def _to_floor(s):
+    if not s:
+        return None
+    m = re.search(r"(\d+)\s*階", s)
+    return int(m.group(1)) if m else None
+
+
+def _to_walk(s):
+    if not s:
+        return None
+    m = re.search(r"歩\s*(\d+)\s*分", s) or re.search(r"(\d+)\s*分", s)
+    return int(m.group(1)) if m else None
+
+
+# --------------------------------------------------------------------------- #
+# ① JSON-LD
+# --------------------------------------------------------------------------- #
+
+def _walk(obj):
+    if isinstance(obj, dict):
+        yield obj
+        for v in obj.values():
+            yield from _walk(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _walk(v)
+
+
+def _from_jsonld(soup):
+    out = {}
+    for sc in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(sc.string or sc.get_text() or "")
+        except Exception:
+            continue
+        for node in _walk(data):
+            if not isinstance(node, dict):
+                continue
+            if "name" in node and "name" not in out and isinstance(node["name"], str):
+                out["name"] = node["name"]
+            # price
+            for key in ("price",):
+                if key in node and "price" not in out:
+                    try:
+                        out["price"] = int(float(str(node[key]).replace(",", "")))
+                    except Exception:
+                        pass
+            off = node.get("offers")
+            if isinstance(off, dict) and "price" not in out and off.get("price"):
+                try:
+                    out["price"] = int(float(str(off["price"]).replace(",", "")))
+                except Exception:
+                    pass
+            fs = node.get("floorSize")
+            if isinstance(fs, dict) and "area" not in out and fs.get("value"):
+                try:
+                    out["area"] = float(str(fs["value"]).replace(",", ""))
+                except Exception:
+                    pass
+            ad = node.get("address")
+            if "address" not in out:
+                if isinstance(ad, str):
+                    out["address"] = ad
+                elif isinstance(ad, dict):
+                    out["address"] = "".join(str(ad.get(k, "")) for k in
+                                             ("addressRegion", "addressLocality", "streetAddress"))
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# ② ラベル表
+# --------------------------------------------------------------------------- #
+
+def _label_map(soup):
+    pairs = {}
     for dt in soup.find_all(["dt", "th"]):
         label = dt.get_text(strip=True)
         if not label:
@@ -1041,71 +1154,52 @@ def _build_label_map(soup: BeautifulSoup) -> dict[str, str]:
     return pairs
 
 
-def _find(pairs: dict[str, str], *keywords: str) -> Optional[str]:
+def _find(pairs, *keys):
     for label, val in pairs.items():
-        if any(k in label for k in keywords):
+        if any(k in label for k in keys):
             return val
     return None
 
 
-def _parse_price_yen(s: Optional[str]) -> Optional[int]:
-    """ "5,480万円" / "1億2,800万円" → 円 """
-    if not s:
-        return None
-    s = s.replace(",", "").replace(" ", "")
-    total = 0
-    m_oku = re.search(r"(\d+(?:\.\d+)?)億", s)
-    if m_oku:
-        total += int(float(m_oku.group(1)) * 1_0000_0000)
-    m_man = re.search(r"(\d+(?:\.\d+)?)万", s)
-    if m_man:
-        total += int(float(m_man.group(1)) * 1_0000)
-    if total:
-        return total
-    m = re.search(r"\d+", s)
-    return int(m.group()) if m else None
+# --------------------------------------------------------------------------- #
+# ③ 全文スキャン（フォールバック）
+# --------------------------------------------------------------------------- #
+
+def _scan_price(text):
+    cands = []
+    for m in re.finditer(r"(?:(\d+)\s*億)?\s*([0-9,]+)\s*万円", text):
+        p = _to_price(m.group(0))
+        if p and 3_000_000 <= p <= 3_000_000_000:   # 300万〜30億の範囲
+            cands.append(p)
+    return max(cands) if cands else None            # 詳細ページでは本体価格が最大になりやすい
 
 
-def _parse_area(s: Optional[str]) -> Optional[float]:
-    if not s:
+def _scan_area(text):
+    cands = []
+    for m in re.finditer(r"(\d+(?:\.\d+)?)\s*(?:㎡|m²|m\s*2|m2|平米)", text, re.I):
+        a = float(m.group(1))
+        if 10 <= a <= 400:
+            cands.append(a)
+    # 専有面積は最頻ではなく「最初の妥当値」を採用しがち。中央値で安定化。
+    if not cands:
         return None
-    m = re.search(r"(\d+(?:\.\d+)?)\s*(?:m|㎡|平米|m2|m²)", s, re.I)
+    cands.sort()
+    return cands[len(cands) // 2]
+
+
+def _scan_address(text):
+    m = _ADDR_RE.search(text)
+    return m.group(0) if m else None
+
+
+def _scan_built(text):
+    m = re.search(r"((?:19|20)\d{2})\s*年\s*(\d{1,2})?\s*月?\s*築", text)
     if m:
-        return float(m.group(1))
-    m = re.search(r"\d+(?:\.\d+)?", s)
-    return float(m.group()) if m else None
-
-
-def _parse_built(s: Optional[str]) -> tuple[Optional[int], Optional[int]]:
-    """ "1998年3月" / "平成10年3月築" → (1998, 3) """
-    if not s:
-        return None, None
-    year = None
-    month = None
-    m = re.search(r"(19|20)\d{2}", s)
+        return int(m.group(1)), (int(m.group(2)) if m.group(2) else None)
+    m = re.search(r"築\s*(\d{1,3})\s*年", text)
     if m:
-        year = int(m.group())
-    else:
-        year = _to_west_year(s)
-    mm = re.search(r"年\s*(\d{1,2})\s*月", s)
-    if mm:
-        month = int(mm.group(1))
-    return year, month
-
-
-def _parse_floor(s: Optional[str]) -> Optional[int]:
-    """ "12階/15階建" / "3階" → 12 """
-    if not s:
-        return None
-    m = re.search(r"(\d+)\s*階", s)
-    return int(m.group(1)) if m else None
-
-
-def _parse_walk(s: Optional[str]) -> Optional[int]:
-    if not s:
-        return None
-    m = re.search(r"歩\s*(\d+)\s*分", s) or re.search(r"(\d+)\s*分", s)
-    return int(m.group(1)) if m else None
+        return _dt.now().year - int(m.group(1)), None
+    return None, None
 
 
 # --------------------------------------------------------------------------- #
@@ -1114,47 +1208,55 @@ def _parse_walk(s: Optional[str]) -> Optional[int]:
 
 def parse_property(html: str, url: str = "") -> Property:
     soup = BeautifulSoup(html, "html.parser")
-    pairs = _build_label_map(soup)
+    full = soup.get_text(" ", strip=True)
+    pairs = _label_map(soup)
+    ld = _from_jsonld(soup)
 
-    # 物件名: og:title or h1
-    name = ""
-    og = soup.find("meta", property="og:title")
-    if og and og.get("content"):
-        name = og["content"].strip()
+    # 物件名
+    name = ld.get("name") or ""
+    if not name:
+        og = soup.find("meta", property="og:title")
+        if og and og.get("content"):
+            name = og["content"].strip()
     if not name:
         h1 = soup.find("h1")
-        name = h1.get_text(strip=True) if h1 else "物件"
-    name = re.sub(r"[｜|].*$", "", name).strip()
+        name = h1.get_text(strip=True) if h1 else ""
+    name = re.sub(r"[｜|【】\[\]].*$", "", name).strip() or "物件"
 
-    price = _parse_price_yen(_find(pairs, "価格", "販売価格"))
-    address = _find(pairs, "所在地", "住所") or ""
-    area = _parse_area(_find(pairs, "専有面積", "面積"))
-    floor_plan = _find(pairs, "間取り") or ""
-    built_year, built_month = _parse_built(_find(pairs, "築年月", "完成", "竣工", "建築年"))
-    floor = _parse_floor(_find(pairs, "所在階", "階数", "向き/階"))
-    station_raw = _find(pairs, "沿線・駅", "交通", "最寄") or ""
-    structure = _find(pairs, "構造", "建物構造") or ""
+    price = (ld.get("price")
+             or _to_price(_find(pairs, "価格", "販売価格", "物件価格"))
+             or _scan_price(full))
+    area_label = _find(pairs, "専有面積", "面積")
+    area = ld.get("area") or _to_area(area_label)
+    if area is None and area_label:
+        mnum = re.search(r"(\d+(?:\.\d+)?)", area_label)
+        if mnum and 10 <= float(mnum.group(1)) <= 400:
+            area = float(mnum.group(1))
+    area = area or _scan_area(full)
+    address = (_find(pairs, "所在地", "住所", "所在")
+               or ld.get("address")
+               or _scan_address(full) or "")
+    by, bm = _to_built(_find(pairs, "築年月", "完成時期", "竣工", "建築年月", "築年"))
+    if not by:
+        by, bm = _scan_built(full)
+    floor_plan = _find(pairs, "間取り", "間取りタイプ") or ""
+    if not floor_plan:
+        m = re.search(r"[1-9]\s?[SLDK]{1,3}", full)
+        floor_plan = m.group(0).replace(" ", "") if m else ""
+    floor = _to_floor(_find(pairs, "所在階", "階数", "向き/階"))
+    station = _find(pairs, "沿線・駅", "交通", "最寄", "アクセス") or ""
 
-    prop = Property(
-        name=name or "物件",
-        price_yen=price,
-        address=address,
-        area_m2=area,
-        floor_plan=floor_plan,
-        built_year=built_year,
-        built_month=built_month,
-        floor=floor,
-        station=station_raw,
-        walk_min=_parse_walk(station_raw),
-        structure=structure,
-        url=url,
-    )
+    prop = Property(name=name[:40], price_yen=price, address=address, area_m2=area,
+                    floor_plan=floor_plan, built_year=by, built_month=bm, floor=floor,
+                    station=station, walk_min=_to_walk(station), structure="", url=url)
 
-    if not (prop.price_yen and prop.area_m2 and prop.address):
+    missing = [n for n, v in (("価格", prop.price_yen), ("専有面積", prop.area_m2),
+                              ("所在地", prop.address)) if not v]
+    if missing:
         raise PropertyParseError(
-            "物件情報の一部を取得できませんでした（価格・面積・所在地）。"
-            "ページ構造が変わった可能性があります。手入力をご利用ください。"
-        )
+            "このページからは " + "・".join(missing) + " を取得できませんでした。"
+            "未対応サイトか、JavaScriptで表示されるページの可能性があります。"
+            "（対応例：SUUMO / HOME'S / 各仲介会社サイト 等のサーバー表示ページ）")
     return prop
 
 
@@ -1263,15 +1365,15 @@ def _annual_rate(comps, est_unit):
 
 # ---- 割安度グレード（売出÷相場：小さいほど割安）----
 GRADES = [
-    (0.85, "S", "急げ！",     "#16a085"),
-    (0.92, "A", "とても割安", "#1aa260"),
+    (0.85, "S", "非常に割安", "#16a085"),
+    (0.92, "A", "かなり割安", "#1aa260"),
     (0.98, "B", "割安",       "#3ac17a"),
-    (1.06, "C", "相場水準",   "#2b8cd9"),
+    (1.06, "C", "適正",       "#2b8cd9"),
     (1.14, "D", "やや割高",   "#e8943a"),
     (1.22, "E", "割高",       "#e0663a"),
-    (9.99, "F", "スケベ価格", "#d9534f"),
+    (9.99, "F", "かなり割高", "#d9534f"),
 ]
-GRADE_LEGEND = "S(急げ！) > A > B > C(相場水準) > D > E > F(スケベ価格)"
+GRADE_LEGEND = ""
 GRADE_COLORS = {g: color for _u, g, _l, color in GRADES}
 
 
@@ -1279,7 +1381,7 @@ def _grade_for(ratio):
     for upper, g, label, color in GRADES:
         if ratio <= upper:
             return g, label, color
-    return "F", "スケベ価格", "#d9534f"
+    return "F", "かなり割高", "#d9534f"
 
 
 def _confidence(n, cv):
@@ -1531,113 +1633,99 @@ def _appraise(prop, use_mock=False, demo=False):
         return Result(ok=False, prop=prop, city_name=city_name, appraisal=ap, message=ap.message, demo=demo)
     return Result(ok=True, prop=prop, appraisal=ap, city_name=city_name, demo=demo)
 
-"""LINE返信（VALUE SCAN）: 物件評価カード(Flex) ＋ 四半期チャート(QuickChart)。"""
+"""LINE返信（VALUE SCAN）: クリーンな割安判定カード(Flex) ＋ 四半期チャート。"""
 import json
 import urllib.parse
 
-TEAL = "#3aa9a0"
+# 国交省API利用規約で必須のクレジット
+MLIT_CREDIT = ("このサービスは、国土交通省不動産情報ライブラリのAPI機能を使用していますが、"
+               "提供情報の最新性、正確性、完全性等が保証されたものではありません。")
 
 
-def _kv(label, value, vbold=False, vcolor="#222222", vsize="md"):
-    return {"type": "box", "layout": "baseline", "contents": [
-        {"type": "text", "text": label, "color": "#888888", "size": "sm", "flex": 4},
-        {"type": "text", "text": value, "color": vcolor, "size": vsize, "flex": 6,
-         "align": "end", "weight": "bold" if vbold else "regular", "wrap": True}]}
-
-
-def _grade_bar(current):
-    cells = [{"type": "box", "layout": "vertical", "flex": 1,
-              "backgroundColor": GRADE_COLORS.get(g, "#ccc"), "cornerRadius": "3px",
-              "paddingTop": "3px", "paddingBottom": "3px",
-              "borderWidth": ("2px" if g == current else "0px"), "borderColor": "#333333",
-              "contents": [{"type": "text", "text": g, "color": "#ffffff",
-                            "weight": "bold", "size": "sm", "align": "center"}]}
-             for g in GRADE_ORDER]
-    ptr = [{"type": "text", "text": ("▲" if g == current else " "), "flex": 1,
-            "color": GRADE_COLORS.get(current, "#333"), "size": "sm", "align": "center"}
-           for g in GRADE_ORDER]
-    return {"type": "box", "layout": "vertical", "spacing": "xs", "margin": "md", "contents": [
-        {"type": "box", "layout": "horizontal", "spacing": "xs", "contents": cells},
-        {"type": "box", "layout": "horizontal", "spacing": "xs", "contents": ptr},
-        {"type": "box", "layout": "horizontal", "contents": [
-            {"type": "text", "text": "割安", "color": "#16a085", "size": "xs"},
-            {"type": "text", "text": "割高", "color": "#d9534f", "size": "xs", "align": "end"}]}]}
+def _row(label, value, bold=False, vcolor="#222222", vsize="sm"):
+    return {"type": "box", "layout": "baseline", "spacing": "sm", "contents": [
+        {"type": "text", "text": label, "size": "sm", "color": "#888888", "flex": 4},
+        {"type": "text", "text": value, "size": vsize, "color": vcolor, "flex": 6,
+         "align": "end", "weight": "bold" if bold else "regular", "wrap": True}]}
 
 
 def build_result_flex(result):
     ap = result.appraisal
     p = result.prop
-    name = (p.name if p else "物件")[:30]
-    spec = " / ".join([x for x in [
-        (p.floor_plan if p else ""),
-        (f"{p.area_m2:.2f}㎡" if (p and p.area_m2) else ""),
-        (f"{p.floor}階" if (p and p.floor) else "")] if x]) or "—"
+    name = (p.name if p else "物件")[:40]
 
     profit = ap.expected_profit or 0
-    verdict = f"相場より {yen_man(abs(profit))} {'割安' if profit >= 0 else '割高'}"
-    vcolor = "#16a085" if profit >= 0 else "#d9534f"
+    if profit >= 0:
+        diff_text = f"相場より {yen_man(abs(profit))} 割安（▼{ap.discount_pct:.0f}%）"
+        diff_color, diff_bg = "#1aa260", "#f3faf5"
+    else:
+        diff_text = f"相場より {yen_man(abs(profit))} 割高（▲{abs(ap.discount_pct):.0f}%）"
+        diff_color, diff_bg = "#d9534f", "#fdf2f2"
 
-    eval_row = {"type": "box", "layout": "horizontal", "spacing": "md", "contents": [
-        {"type": "box", "layout": "vertical", "flex": 7, "contents": [
-            {"type": "text", "text": verdict, "color": vcolor, "weight": "bold",
-             "size": "lg", "wrap": True},
-            {"type": "text", "text": f"相場価格 {yen_man(ap.estimated_price)}",
-             "size": "sm", "color": "#555555", "margin": "sm"},
-            {"type": "text", "text": f"相場坪単価 {tsubo_man(ap.estimated_unit_price)}",
-             "size": "sm", "color": "#555555"}]},
-        {"type": "box", "layout": "vertical", "flex": 0, "width": "64px", "height": "64px",
-         "backgroundColor": GRADE_COLORS.get(ap.grade, "#888"), "cornerRadius": "8px",
-         "justifyContent": "center", "contents": [
-             {"type": "text", "text": ap.grade or "?", "color": "#ffffff",
-              "weight": "bold", "size": "3xl", "align": "center"}]}]}
+    header = {"type": "box", "layout": "vertical", "backgroundColor": ap.grade_color,
+              "paddingAll": "16px", "spacing": "xs", "contents": [
+                  {"type": "text", "text": "VALUE SCAN 割安度判定", "color": "#ffffffcc", "size": "xs"},
+                  {"type": "text", "text": name, "color": "#ffffff", "size": "md",
+                   "weight": "bold", "wrap": True},
+                  {"type": "box", "layout": "baseline", "spacing": "md", "margin": "md", "contents": [
+                      {"type": "text", "text": ap.grade or "?", "color": "#ffffff",
+                       "size": "4xl", "weight": "bold", "flex": 0},
+                      {"type": "text", "text": ap.grade_label, "color": "#ffffff",
+                       "size": "lg", "weight": "bold", "gravity": "center"}]}]}
 
     body = [
-        {"type": "text", "text": spec, "size": "sm", "color": "#444444", "wrap": True},
-        {"type": "separator", "margin": "md"},
-        _kv("物件価格", yen_man(ap.asking_price), vbold=True, vsize="lg"),
-        _kv("坪単価", tsubo_man(ap.asking_unit_price)),
-        {"type": "separator", "margin": "md"},
-        {"type": "text", "text": "物件評価", "weight": "bold", "size": "md", "margin": "md"},
-        eval_row,
-        _grade_bar(ap.grade),
+        _row("売出価格", yen_man(ap.asking_price), bold=True, vsize="md"),
+        _row("推定相場", yen_man(ap.estimated_price), bold=True, vsize="md"),
+        _row("推定レンジ", f"{yen_man(ap.price_low)}〜{yen_man(ap.price_high)}"),
+        {"type": "box", "layout": "vertical", "margin": "md", "paddingAll": "10px",
+         "backgroundColor": diff_bg, "cornerRadius": "8px", "contents": [
+             {"type": "text", "text": diff_text, "size": "sm", "weight": "bold",
+              "color": diff_color, "align": "center", "wrap": True}]},
         {"type": "separator", "margin": "lg"},
-        {"type": "text", "text": "直近の成約事例", "weight": "bold", "size": "md", "margin": "md"},
-    ]
-    lt = ap.latest or {}
-    if lt:
-        tag = "成約" if lt.get("is_deal") else "取引"
-        area = f"{lt['area']:.2f}㎡" if lt.get("area") else "—"
-        body += [
-            {"type": "box", "layout": "horizontal", "contents": [
-                {"type": "text", "text": f"{lt.get('period', '')} {tag}", "size": "sm", "color": "#555555"},
-                {"type": "text", "text": lt.get("floor_plan", ""), "size": "sm", "color": "#555555", "align": "end"}]},
-            {"type": "box", "layout": "horizontal", "contents": [
-                {"type": "text", "text": yen_man(lt.get("trade_price")), "size": "lg",
-                 "weight": "bold", "color": "#1a8a7a"},
-                {"type": "text", "text": area, "size": "sm", "color": "#555555",
-                 "align": "end", "gravity": "bottom"}]},
-            {"type": "text", "text": f"坪単価：{tsubo_man(lt.get('unit_price'))}",
-             "size": "sm", "color": "#555555"}]
-    else:
-        body.append({"type": "text", "text": "（周辺の事例が不足しています）",
-                     "size": "sm", "color": "#999999"})
-    body += [
+        _row("1年後の予測相場", f"{yen_man(ap.future_price)}（{ap.future_grade}）"),
+        _row("年間騰落率", f"{ap.annual_rate * 100:+.1f}%"),
         {"type": "separator", "margin": "lg"},
-        {"type": "text", "text": "データ出典元：国土交通省 不動産情報ライブラリ",
-         "size": "xxs", "color": "#aaaaaa", "margin": "md", "wrap": True},
-        {"type": "text", "text": f"※割安度 {GRADE_LEGEND}",
-         "size": "xxs", "color": "#aaaaaa", "wrap": True},
     ]
+    if p and p.area_m2:
+        body.append(_row("専有面積", f"{p.area_m2:.0f}㎡"))
+    if p and p.floor_plan:
+        body.append(_row("間取り", p.floor_plan))
+    body.append(_row("坪単価", tsubo_man(ap.asking_unit_price)))
+    if p and p.age is not None:
+        body.append(_row("築年数", f"築{p.age}年（{p.built_year}年）"))
+    if result.city_name:
+        body.append(_row("エリア", result.city_name))
+    body.append({"type": "separator", "margin": "lg"})
+    body.append({"type": "text", "text": f"周辺の取引・成約事例（{ap.n_comps}件中）",
+                 "size": "sm", "weight": "bold", "color": "#2b8cd9", "margin": "md"})
+    for c in ap.representative[:3]:
+        tag = "成約" if c.is_deal else "取引"
+        area = f"{c.area:.0f}㎡" if c.area else "—"
+        age = f"築{c.age}" if c.age is not None else ""
+        body.append({"type": "text",
+                     "text": f"[{tag}] {yen_man(c.trade_price)} / {area} {age} / {c.station or c.district}",
+                     "size": "xs", "color": "#555555", "wrap": True, "margin": "sm"})
+    body.append({"type": "text", "text": f"判定根拠: {ap.method}・信頼度 {ap.confidence}",
+                 "size": "xxs", "color": "#aaaaaa", "margin": "md", "wrap": True})
+
+    footer_contents = []
+    if p and p.url:
+        footer_contents.append({"type": "button", "style": "primary", "height": "sm",
+                                "color": ap.grade_color,
+                                "action": {"type": "uri", "label": "物件ページを見る", "uri": p.url}})
+    footer_contents.append({"type": "text",
+                            "text": "推定値です。実際の価値は個別条件で変動します。",
+                            "size": "xxs", "color": "#aaaaaa", "wrap": True, "margin": "sm"})
+    footer = {"type": "box", "layout": "vertical", "paddingAll": "12px",
+              "spacing": "sm", "contents": footer_contents}
 
     bubble = {"type": "bubble", "size": "mega",
-              "header": {"type": "box", "layout": "vertical", "backgroundColor": TEAL,
-                         "paddingAll": "16px", "contents": [
-                             {"type": "text", "text": name, "color": "#ffffff",
-                              "weight": "bold", "size": "xl", "wrap": True}]},
+              "header": header,
               "body": {"type": "box", "layout": "vertical", "paddingAll": "16px",
-                       "spacing": "sm", "contents": body}}
+                       "spacing": "sm", "contents": body},
+              "footer": footer}
     return {"type": "flex",
-            "altText": f"{name} の割安度判定：{ap.grade}（相場{yen_man(ap.estimated_price)}）",
+            "altText": f"{name} の割安度判定：{ap.grade}（{ap.grade_label}）",
             "contents": bubble}
 
 
@@ -1672,11 +1760,9 @@ def _chart_cfg(ap, quarters, lite=False):
 
 
 def chart_url(ap):
-    """QuickChartで四半期チャート。まず短縮URL(POST)、失敗時はGET簡易版。"""
     ql = getattr(ap, "quarterly", None)
     if not ql or len(ql) < 2:
         return None
-    # 1) POST 短縮URL（全データセット・きれいなラベル）
     try:
         r = requests.post("https://quickchart.io/chart/create",
                           json={"chart": _chart_cfg(ap, 16, lite=False),
@@ -1688,7 +1774,6 @@ def chart_url(ap):
                 return j["url"]
     except Exception:
         pass
-    # 2) GETフォールバック（簡易版・URL長に収まる範囲で）
     for keep in (10, 8, 6, 4):
         c = json.dumps(_chart_cfg(ap, keep, lite=True), ensure_ascii=False, separators=(",", ":"))
         url = "https://quickchart.io/chart?w=700&h=400&bkg=white&c=" + urllib.parse.quote(c)
@@ -1714,11 +1799,10 @@ def build_messages(result):
 WELCOME_TEXT = (
     "はじめまして！VALUE SCANです。\n"
     "友だち追加ありがとうございます😊\n\n"
-    "VALUE SCANは中古マンションの割安度判定ができるサービスです。\n"
-    "気になる物件のURL（現在はSUUMOのみ対応）を送ってください！\n"
-    "10秒程度で判定結果をお返しします。\n"
+    "気になる中古マンションの物件ページURL（SUUMO・HOME'S 等）を送ってください！\n"
+    "10秒程度で割安/割高の判定結果をお返しします。\n"
     "もし結果が返ってこない場合は、お手数ですが再送ください。\n\n"
-    "※判定は国土交通省の公開取引データに基づく推定値であり、結果を保証するものではありません。"
+    "※" + MLIT_CREDIT
 )
 
 INDEX_HTML = r'''<!DOCTYPE html>
@@ -1802,6 +1886,8 @@ INDEX_HTML = r'''<!DOCTYPE html>
   .step .n{width:24px;height:24px;border-radius:50%;background:var(--blue);color:#fff;
         font-size:13px;font-weight:700;display:flex;align-items:center;justify-content:center;margin:0 auto 6px}
   .step .t{font-size:12px;color:var(--muted)}
+  .srow{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:9px 0;border-bottom:1px solid var(--line)}
+  .srow b{white-space:nowrap}
   footer.site{text-align:center;color:var(--muted);font-size:11px;padding:24px}
 </style>
 </head>
@@ -1822,9 +1908,9 @@ INDEX_HTML = r'''<!DOCTYPE html>
   <main class="wrap">
     <section class="card">
       <h2>SUUMOのURLで割安度をチェック</h2>
-      <p class="sub">中古マンションの物件ページURLを貼り付けてください。</p>
+      <p class="sub">中古マンションの物件ページURLを貼り付けてください（SUUMO・HOME'S・各仲介会社サイト等）。</p>
       <form id="form" class="field">
-        <input id="url" type="url" placeholder="https://suumo.jp/ms/chuko/..." autocomplete="off">
+        <input id="url" type="url" placeholder="物件ページのURL（SUUMO・HOME'S 等）" autocomplete="off">
         <button class="btn-go" type="submit">判定する</button>
       </form>
       <button class="demo" id="demoBtn" type="button">▶ サンプル物件で試す（キー設定なしでOK）</button>
@@ -1834,13 +1920,27 @@ INDEX_HTML = r'''<!DOCTYPE html>
         <div class="step"><div class="n">3</div><div class="t">割安度A〜Eで判定</div></div>
       </div>
       <p class="note">※判定は公的取引データに基づく推定値です。実際の価値は個別条件で変動します。
-         ※SUUMOの自動取得は同サイト規約の確認が必要です（本デモは学習・検証用）。</p>
+         ※各サイトの自動取得は各社規約の確認が必要です（学習・検証用）。</p>
     </section>
 
     <section id="result"></section>
+
+    <section class="card" style="margin-top:18px">
+      <h2>対応サイト（目安）</h2>
+      <p class="sub">物件ページのURLを送ると判定します。取得可否はページ構造により変わります。</p>
+      <div style="font-size:14px">
+        <div class="srow"><span>SUUMO</span><b style="color:#1aa260">✅ 対応</b></div>
+        <div class="srow"><span>LIFULL HOME'S</span><b style="color:#1aa260">✅ 対応</b></div>
+        <div class="srow"><span>各仲介会社サイト<br><span style="color:#889;font-size:12px">三井のリハウス/東急リバブル/住友不動産販売/ノムコム/三菱地所ハウスネット/東京建物/大京穴吹 ほか</span></span><b style="color:#e8943a">△ ページにより対応</b></div>
+        <div class="srow"><span>ニフティ不動産</span><b style="color:#e8943a">△ 要確認</b></div>
+        <div class="srow"><span>at home</span><b style="color:#e8943a">△ 取得制限が強く不可が多い</b></div>
+        <div class="srow"><span>Yahoo!不動産</span><b style="color:#d9534f">❌ 未対応（JS描画）</b></div>
+      </div>
+      <p class="note">※ JavaScriptで表示されるサイト（Yahoo!不動産等）やアクセス制限の強いサイトは取得できません。取得できない場合は、SUUMO や HOME'S のURLをお試しください。</p>
+    </section>
   </main>
 
-  <footer class="site">© VALUE SCAN（学習用プロトタイプ）｜データ出典：国土交通省 不動産情報ライブラリ</footer>
+  <footer class="site">© VALUE SCAN（学習用プロトタイプ）<br>このサービスは、国土交通省不動産情報ライブラリのAPI機能を使用していますが、提供情報の最新性・正確性・完全性等が保証されたものではありません。</footer>
 
 <script>
 const form = document.getElementById('form');
@@ -1911,7 +2011,7 @@ function render(d){
      </div>
      <div class="res-foot">
        ${p.url?`<a href="${esc(p.url)}" target="_blank" rel="noopener">SUUMOで物件を見る →</a><br>`:''}
-       推定値です。割安判定が出ても利益を保証するものではありません。データ出典：国土交通省 不動産情報ライブラリ
+       推定値です。割安判定が出ても利益を保証するものではありません。
      </div>
    </div>`;
   result.scrollIntoView({behavior:'smooth', block:'start'});
