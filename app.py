@@ -943,7 +943,7 @@ import re
 from dataclasses import dataclass, asdict
 
 from typing import Optional
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 
 import requests
 from bs4 import BeautifulSoup
@@ -1262,6 +1262,59 @@ def parse_property(html: str, url: str = "") -> Property:
 
 def fetch_property(url: str) -> Property:
     return parse_property(fetch_html(url), url)
+
+
+# --------------------------------------------------------------------------- #
+# 一覧（検索結果）ページの抽出
+# --------------------------------------------------------------------------- #
+
+def parse_listing(html: str, base_url: str = "") -> list:
+    """検索結果ページから物件サマリ（名前/価格/面積/所在地/築年/URL）を複数抽出。"""
+    soup = BeautifulSoup(html, "html.parser")
+    items = []
+    blocks = soup.select("div.property_unit-content") or soup.select("div.property_unit")
+    for b in blocks:
+        a = b.select_one(".property_unit-title a") or b.find("a", href=True)
+        name = a.get_text(strip=True) if a else "物件"
+        href = a.get("href") if a else ""
+        txt = b.get_text(" ", strip=True)
+        pairs = _label_map(b)
+        price = _to_price(_find(pairs, "価格", "販売価格")) or _scan_price(txt)
+        area = _to_area(_find(pairs, "専有面積", "面積")) or _scan_area(txt)
+        addr = _find(pairs, "所在地", "住所") or _scan_address(txt) or ""
+        by, _bm = _to_built(_find(pairs, "築年月", "築年数", "築年"))
+        if not by:
+            by, _bm = _scan_built(txt)
+        if price and area:
+            items.append({"name": name[:40], "url": urljoin(base_url, href) if href else "",
+                          "price_yen": price, "area_m2": area, "address": addr, "built_year": by})
+    if items:
+        return items
+    # 汎用フォールバック：詳細リンクの近傍ブロックから抽出
+    seen = set()
+    for a in soup.find_all("a", href=True):
+        cur = a
+        for _ in range(5):
+            cur = cur.parent
+            if cur is None:
+                break
+            txt = cur.get_text(" ", strip=True)
+            if "万円" in txt and re.search(r"\d+(?:\.\d+)?\s*(?:㎡|m²|m\s*2|平米)", txt) and len(txt) < 600:
+                price = _scan_price(txt)
+                area = _scan_area(txt)
+                url = urljoin(base_url, a["href"])
+                if price and area and url not in seen:
+                    seen.add(url)
+                    by, _bm = _scan_built(txt)
+                    items.append({"name": (a.get_text(strip=True) or "物件")[:40], "url": url,
+                                  "price_yen": price, "area_m2": area,
+                                  "address": _scan_address(txt) or "", "built_year": by})
+                break
+    return items
+
+
+def fetch_listing(url: str) -> list:
+    return parse_listing(fetch_html(url), url)
 
 """
 相場推定と割安判定ロジック（VALUE SCAN）。
@@ -1662,6 +1715,52 @@ def _appraise(prop, use_mock=False, demo=False):
         return Result(ok=False, prop=prop, city_name=city_name, appraisal=ap, message=ap.message, demo=demo)
     return Result(ok=True, prop=prop, appraisal=ap, city_name=city_name, demo=demo)
 
+
+def screen_listing(url, use_mock=False, limit=30):
+    """検索結果ページ→各物件を判定→割安順（Sが上）に集計。"""
+    try:
+        items = fetch_listing(url)
+    except PropertyParseError as e:
+        return {"ok": False, "message": str(e)}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "message": f"一覧ページ取得エラー: {e}"}
+    if not items:
+        return {"ok": False, "message": "このページから物件一覧を抽出できませんでした"
+                "（未対応/JS描画の可能性）。SUUMOの一覧ページでお試しください。"}
+
+    comps_cache = {}
+    results = []
+    for it in items[:limit]:
+        prop = Property(name=it["name"], price_yen=it["price_yen"], address=it["address"],
+                              area_m2=it["area_m2"], floor_plan="", built_year=it["built_year"],
+                              built_month=None, floor=None, station="", walk_min=None,
+                              structure="", url=it["url"])
+        if use_mock:
+            comps = fetch_comps("00000", use_mock=True)
+        else:
+            try:
+                _, city_code, _cn = resolve_city_code(prop.address)
+            except ReinfolibError:
+                continue
+            if not city_code:
+                continue
+            if city_code not in comps_cache:
+                comps_cache[city_code] = fetch_comps(city_code)
+            comps = comps_cache[city_code]
+        ap = appraise(prop.area_m2, prop.age, prop.price_yen, comps,
+                                district=_district_of(prop.address))
+        if not ap.ok:
+            continue
+        results.append({"name": prop.name, "url": prop.url, "grade": ap.grade,
+                        "grade_label": ap.grade_label, "grade_color": ap.grade_color,
+                        "price_man": yen_man(ap.asking_price),
+                        "market_man": yen_man(ap.estimated_price),
+                        "discount_pct": round(ap.discount_pct, 1), "ratio": ap.ratio,
+                        "area": prop.area_m2, "built_year": prop.built_year})
+    results.sort(key=lambda r: r["ratio"])
+    return {"ok": True, "scanned": len(items), "judged": len(results),
+            "s_count": sum(1 for r in results if r["grade"] == "S"), "results": results}
+
 """LINE返信（VALUE SCAN）: クリーンな割安判定カード(Flex) ＋ 四半期チャート。"""
 import json
 import urllib.parse
@@ -1955,6 +2054,18 @@ INDEX_HTML = r'''<!DOCTYPE html>
     <section id="result"></section>
 
     <section class="card" style="margin-top:18px">
+      <h2>一覧ページから一括判定（Sランク抽出）</h2>
+      <p class="sub">SUUMO等の検索結果ページのURLを貼ると、掲載物件をまとめて判定し、割安順（S→）に並べます。</p>
+      <form id="sform" class="field">
+        <input id="surl" type="url" placeholder="検索結果ページのURL（SUUMO）" autocomplete="off">
+        <button class="btn-go" type="submit">一括判定</button>
+      </form>
+      <label style="font-size:12px;color:var(--muted);display:inline-block;margin-top:8px"><input type="checkbox" id="sonly"> Sランクのみ表示</label>
+      <div id="sresult"></div>
+      <p class="note">※掲載物件を順に判定します（件数により時間がかかります）。ページ取得は各サイトの規約をご確認ください。実判定には国交省キーが必要です。</p>
+    </section>
+
+    <section class="card" style="margin-top:18px">
       <h2>対応サイト（目安）</h2>
       <p class="sub">物件ページのURLを送ると判定します。取得可否はページ構造により変わります。</p>
       <div style="font-size:14px">
@@ -2053,6 +2164,40 @@ form.addEventListener('submit', e=>{
   appraise({url});
 });
 demoBtn.addEventListener('click', ()=> appraise({demo:true}));
+
+const sform=document.getElementById('sform');
+const sresult=document.getElementById('sresult');
+const sonly=document.getElementById('sonly');
+let _sdata=null;
+function thisYear(){return new Date().getFullYear();}
+function srender(){
+  if(!_sdata){sresult.innerHTML='';return;}
+  if(!_sdata.ok){sresult.innerHTML='<div class="err" style="margin-top:10px">\u26a0\ufe0f '+esc(_sdata.message)+'</div>';return;}
+  let rows=_sdata.results||[];
+  if(sonly.checked) rows=rows.filter(r=>r.grade==='S');
+  const head='<div class="sub" style="margin:12px 0 6px">判定 '+_sdata.judged+'件 ／ Sランク '+_sdata.s_count+'件（割安順）</div>';
+  if(!rows.length){sresult.innerHTML=head+'<p class="sub">該当物件がありません。</p>';return;}
+  sresult.innerHTML=head+rows.map(r=>`
+    <div class="srow" style="align-items:flex-start">
+      <div style="flex:1">
+        <div><b style="color:${r.grade_color};font-size:16px">${r.grade}</b> <span style="font-size:13px">${esc(r.name)}</span></div>
+        <div style="font-size:12px;color:#889">売出 ${esc(r.price_man)} / 推定 ${esc(r.market_man)} / ${r.discount_pct>=0?'\u25bc'+r.discount_pct:'\u25b2'+Math.abs(r.discount_pct)}% ${r.area?'/ '+Math.round(r.area)+'\u33a1':''} ${r.built_year?'/ 築'+(thisYear()-r.built_year)+'年':''}</div>
+      </div>
+      ${r.url?`<a href="${esc(r.url)}" target="_blank" rel="noopener" style="font-size:12px;white-space:nowrap">見る</a>`:''}
+    </div>`).join('');
+}
+if(sform){
+  sform.addEventListener('submit', async e=>{
+    e.preventDefault();
+    const url=document.getElementById('surl').value.trim(); if(!url) return;
+    sresult.innerHTML='<div class="loading"><div class="spinner"></div>一覧を判定しています…</div>';
+    try{
+      const r=await fetch('/api/screen',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url})});
+      _sdata=await r.json(); srender();
+    }catch(err){ sresult.innerHTML='<div class="err">通信エラーが発生しました。</div>'; }
+  });
+  sonly.addEventListener('change', srender);
+}
 </script>
 </body>
 </html>
@@ -2222,6 +2367,15 @@ def callback():
         _reply(reply_token, build_messages(result))
 
     return "OK"
+
+
+@app.post("/api/screen")
+def api_screen():
+    payload = request.get_json(silent=True) or {}
+    url = is_suumo_url(payload.get("url", ""))
+    if not url:
+        return jsonify({"ok": False, "message": "一覧ページのURLを入力してください。"}), 400
+    return jsonify(screen_listing(url, use_mock=DEMO_MODE))
 
 
 @app.get("/healthz")
