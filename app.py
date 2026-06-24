@@ -1,5 +1,5 @@
 from __future__ import annotations
-import base64, hashlib, hmac, json, os, math, re, statistics, datetime, urllib.parse
+import base64, hashlib, hmac, json, os, math, re, statistics, datetime, urllib.parse, gzip
 from dataclasses import dataclass, field, asdict
 from datetime import datetime as _dt
 from functools import lru_cache
@@ -644,6 +644,7 @@ APIキー（無料・申請制、発行まで約5営業日）は環境変数 `RE
 """
 
 
+import gzip
 import json
 import os
 import re
@@ -725,7 +726,13 @@ def _request(endpoint: str, params: dict) -> dict:
         raise ReinfolibError("APIキーが無効です（401）。キーを確認してください。")
     if resp.status_code != 200:
         raise ReinfolibError(f"APIエラー {resp.status_code}: {resp.text[:200]}")
-    body = resp.json()
+    try:
+        body = resp.json()
+    except Exception:
+        try:
+            body = json.loads(gzip.decompress(resp.content).decode("utf-8"))
+        except Exception as e:  # noqa: BLE001
+            raise ReinfolibError(f"レスポンス解析エラー: {e}")
     if body.get("status") not in ("OK", None):
         raise ReinfolibError(f"APIステータス異常: {body.get('status')}")
     return body
@@ -758,6 +765,16 @@ def list_cities(pref_code: str) -> tuple[tuple[str, str], ...]:
     return tuple(out)
 
 
+_FALLBACK_CITIES = {
+    "千代田区": "13101", "中央区": "13102", "港区": "13103", "新宿区": "13104",
+    "文京区": "13105", "台東区": "13106", "墨田区": "13107", "江東区": "13108",
+    "品川区": "13109", "目黒区": "13110", "大田区": "13111", "世田谷区": "13112",
+    "渋谷区": "13113", "中野区": "13114", "杉並区": "13115", "豊島区": "13116",
+    "北区": "13117", "荒川区": "13118", "板橋区": "13119", "練馬区": "13120",
+    "足立区": "13121", "葛飾区": "13122", "江戸川区": "13123",
+}
+
+
 def resolve_city_code(address: str) -> tuple[Optional[str], Optional[str], Optional[str]]:
     """
     住所から (都道府県コード, 市区町村コード, 市区町村名) を解決する。
@@ -767,12 +784,13 @@ def resolve_city_code(address: str) -> tuple[Optional[str], Optional[str], Optio
     if not pref:
         return None, None, None
     pref_code = PREFECTURE_CODES[pref]
-    try:
-        cities = list_cities(pref_code)
-    except ReinfolibError:
-        return pref_code, None, None
-
-    best = None  # (一致長, code, name)
+    # 1) 東京23区は静的テーブルで確実に解決（XIT002に依存しない）
+    for name, code in _FALLBACK_CITIES.items():
+        if rest.startswith(name):
+            return pref_code, code, name
+    # 2) XIT002で解決（失敗時はReinfolibErrorを伝播して原因を表示）
+    cities = list_cities(pref_code)
+    best = None
     for code, name in cities:
         if rest.startswith(name) and (best is None or len(name) > best[0]):
             best = (len(name), code, name)
@@ -1715,7 +1733,7 @@ def _appraise(prop, use_mock=False, demo=False):
         except ReinfolibError as e:
             return Result(ok=False, prop=prop, message=str(e))
         if not city_code:
-            return Result(ok=False, prop=prop, message="所在地から市区町村を特定できませんでした。")
+            return Result(ok=False, prop=prop, message=f"所在地『{prop.address}』から市区町村を特定できませんでした。")
     else:
         city_name = "東京都江東区（サンプル）"
     try:
